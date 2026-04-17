@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session 详情 - Agent 运行日志</title>
+    <link rel="stylesheet" href="static/style.css">
+    <style>
+        /* Conversation-style log viewer */
+        .conv-message {
+            margin: 8px 16px;
+            max-width: 85%;
+        }
+        .conv-message.agent { align-self: flex-start; }
+        .conv-message.user  { align-self: flex-end; margin-left: auto; }
+
+        .conv-bubble {
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 13px;
+            line-height: 1.55;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .conv-bubble.text-bubble {
+            background: #2a2d2e;
+            color: #d4d4d4;
+            border: 1px solid #3a3d3e;
+        }
+        .conv-bubble.tool-bubble {
+            background: #1e2a1e;
+            color: #9cdcb4;
+            border: 1px solid #2d4a2d;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .conv-bubble.tool-result-bubble {
+            background: #1e1e2a;
+            color: #9bb0d4;
+            border: 1px solid #2d3a5a;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .conv-bubble.error-bubble {
+            background: #2a1e1e;
+            color: #f48771;
+            border: 1px solid #5a2d2d;
+        }
+        .conv-bubble.done-bubble {
+            background: #1e2a1e;
+            color: #7ec867;
+            border: 1px solid #2a4a2a;
+            font-style: italic;
+        }
+        .conv-bubble.session-bubble {
+            background: #252526;
+            color: #858585;
+            border: 1px solid #333;
+            font-size: 11px;
+        }
+        .conv-meta {
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 3px;
+            padding-left: 2px;
+        }
+        .conv-label {
+            font-weight: 600;
+            margin-right: 6px;
+        }
+        .conv-label.codex { color: #e8a87c; }
+        .conv-label.claude { color: #b39ddb; }
+        .conv-label.tool { color: #9cdcb4; }
+        .conv-label.result { color: #9bb0d4; }
+        .conv-label.sys { color: #666; }
+        .tool-name {
+            font-weight: 700;
+            color: #7ec867;
+            margin-bottom: 4px;
+        }
+        .tool-input {
+            color: #a8c0a8;
+            margin-top: 4px;
+            opacity: 0.85;
+        }
+        .log-content {
+            display: flex;
+            flex-direction: column;
+            padding: 12px 0;
+            gap: 4px;
+            overflow-y: auto;
+        }
+        /* toggle for raw mode */
+        .view-toggle {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-left: auto;
+        }
+        .view-toggle button {
+            background: #3a3d3e;
+            border: 1px solid #555;
+            color: #ccc;
+            padding: 3px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .view-toggle button.active {
+            background: #4a7c59;
+            border-color: #7ec867;
+            color: #fff;
+        }
+        /* Raw mode reuses existing log-line styles from style.css */
+        #raw-content { display: none; }
+        #raw-content.visible { display: block; }
+        #conv-content { display: flex; flex-direction: column; }
+        #conv-content.hidden { display: none; }
+        .log-viewer header {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="logs-container">
+        <!-- Session List Sidebar -->
+        <aside class="session-list">
+            <h2><a href="index.html" style="text-decoration: none; color: inherit;">← 返回群聊</a></h2>
+            <h2 style="margin-top: 16px;">Sessions</h2>
+            <div id="session-groups">
+                <p style="color: #666; font-size: 12px;">加载中...</p>
+            </div>
+        </aside>
+
+        <!-- Log Viewer -->
+        <main class="log-viewer">
+            <header>
+                <h2 id="log-title">选择一个 session 查看</h2>
+                <span id="log-status" style="font-size: 12px; color: #666;"></span>
+                <div class="view-toggle" id="view-toggle" style="display:none;">
+                    <button id="btn-conv" class="active" onclick="setView('conv')">对话视图</button>
+                    <button id="btn-raw" onclick="setView('raw')">原始日志</button>
+                </div>
+            </header>
+            <!-- Conversation view -->
+            <div id="conv-content" class="log-content"></div>
+            <!-- Raw view -->
+            <div id="raw-content" class="log-content"></div>
+        </main>
+    </div>
+
+    <script>
+        let currentSessionId = null;
+        let ws = null;
+        let currentView = 'conv'; // 'conv' | 'raw'
+        // Accumulate all log entries for the current session (for view switching)
+        let sessionLogs = [];
+
+        // ── View toggle ──────────────────────────────────────────────────────────
+        function setView(mode) {
+            currentView = mode;
+            document.getElementById('conv-content').classList.toggle('hidden', mode !== 'conv');
+            document.getElementById('raw-content').classList.toggle('visible', mode === 'raw');
+            document.getElementById('btn-conv').classList.toggle('active', mode === 'conv');
+            document.getElementById('btn-raw').classList.toggle('active', mode === 'raw');
+        }
+
+        // ── Conversation rendering ───────────────────────────────────────────────
+
+        /**
+         * Parse a single DB log entry into zero or more conversation items.
+         * Returns array of {kind, agent, label, content, ts, extra}
+         */
+        function parseLogEntry(log) {
+            const { stream, content, event_type, timestamp } = log;
+            const ts = formatTs(timestamp);
+
+            // stderr — show as system note
+            if (stream === 'stderr') {
+                return [{ kind: 'stderr', label: 'STDERR', content, ts }];
+            }
+
+            if (stream !== 'event') return [];
+
+            // Parse the JSON event
+            let event;
+            try { event = JSON.parse(content); } catch (_) { return []; }
+            if (!event || typeof event !== 'object') return [];
+
+            const type = event.type;
+
+            // ── Claude events ────────────────────────────────────
+            // assistant: text / tool_use blocks
+            if (type === 'assistant') {
+                const items = [];
+                const blocks = (event.message && event.message.content) || [];
+                for (const block of blocks) {
+                    if (block.type === 'text' && block.text && block.text.trim()) {
+                        items.push({ kind: 'text', agent: 'claude', label: 'Claude', content: block.text.trim(), ts });
+                    } else if (block.type === 'tool_use') {
+                        items.push({
+                            kind: 'tool_use',
+                            agent: 'claude',
+                            label: 'Claude',
+                            toolName: block.name,
+                            toolInput: block.input,
+                            ts
+                        });
+                    }
+                }
+                return items;
+            }
+
+            // tool result (tool_result event from Claude)
+            if (type === 'tool_result' || event_type === 'tool_result') {
+                const resultContent = event.content || event.output || '';
+                const isError = !!(event.is_error || event.error);
+                return [{ kind: 'tool_result', label: isError ? 'Tool Error' : 'Tool Result', content: String(resultContent).slice(0, 3000), isError, ts }];
+            }
+
+            // stream_event — only grab text_delta for incremental display (skip all others)
+            if (type === 'stream_event') {
+                const se = event.event || {};
+                if (se.type === 'content_block_delta') {
+                    const delta = se.delta || {};
+                    if (delta.type === 'text_delta' && delta.text) {
+                        // We'll accumulate these separately; skip raw ones since 'assistant' event has the full text
+                        return [];
+                    }
+                }
+                return []; // skip all stream_event noise
+            }
+
+            // system/init
+            if (type === 'system' && event.subtype === 'init') {
+                return [{ kind: 'session_init', label: 'Session', content: `Session ID: ${event.session_id || '?'}`, ts }];
+            }
+
+            // result
+            if (type === 'result') {
+                const ok = event.subtype === 'success';
+                const summary = event.result || '';
+                const cost = event.total_cost_usd != null ? ` · $${event.total_cost_usd.toFixed(4)}` : '';
+                const turns = event.num_turns != null ? ` · ${event.num_turns} turns` : '';
+                return [{ kind: 'done', label: ok ? 'Done' : 'Error', content: (summary || (ok ? 'Completed' : 'Error')) + cost + turns, ts }];
+            }
+
+            // ── Codex events ─────────────────────────────────────
+            // item.completed
+            if (type === 'item.completed') {
+                const item = event.item || {};
+                const itemType = item.type;
+
+                if (itemType === 'agent_message' && item.text && item.text.trim()) {
+                    return [{ kind: 'text', agent: 'codex', label: 'Codex', content: item.text.trim(), ts }];
+                }
+                if (itemType === 'message') {
+                    const parts = (item.content || [])
+                        .filter(p => p.type === 'output_text' && p.text)
+                        .map(p => p.text.trim())
+                        .join('\n');
+                    if (parts) return [{ kind: 'text', agent: 'codex', label: 'Codex', content: parts, ts }];
+                }
+                if (itemType === 'command_execution') {
+                    const cmd = item.command;
+                    const out = (item.output && (item.output.stdout || item.output.stderr)) || item.output || '';
+                    const exitCode = item.exit_code != null ? ` (exit ${item.exit_code})` : '';
+                    return [{
+                        kind: 'tool_result',
+                        label: 'Command' + exitCode,
+                        content: (cmd ? `$ ${JSON.stringify(cmd)}\n` : '') + String(out).slice(0, 2000),
+                        isError: item.exit_code !== 0 && item.exit_code != null,
+                        ts
+                    }];
+                }
+                if (itemType === 'file_change') {
+                    return [{
+                        kind: 'tool_use',
+                        agent: 'codex',
+                        label: 'Codex',
+                        toolName: 'file_change',
+                        toolInput: { operation: item.operation, path: item.path },
+                        ts
+                    }];
+                }
+                return [];
+            }
+
+            // item.started (command execution starting)
+            if (type === 'item.started') {
+                const item = event.item || {};
+                if (item.type === 'command_execution') {
+                    const cmd = item.command;
+                    return [{
+                        kind: 'tool_use',
+                        agent: 'codex',
+                        label: 'Codex',
+                        toolName: 'command_execution',
+                        toolInput: { command: cmd },
+                        ts
+                    }];
+                }
+                return [];
+            }
+
+            // thread.started
+            if (type === 'thread.started') {
+                return [{ kind: 'session_init', label: 'Session', content: `Thread ID: ${event.thread_id || '?'}`, ts }];
+            }
+
+            // turn.completed → token usage
+            if (type === 'turn.completed') {
+                const u = event.usage || {};
+                const parts = [];
+                if (u.input_tokens) parts.push(`input: ${u.input_tokens}`);
+                if (u.output_tokens) parts.push(`output: ${u.output_tokens}`);
+                if (u.cached_input_tokens) parts.push(`cached: ${u.cached_input_tokens}`);
+                return [{ kind: 'done', label: 'Turn done', content: parts.join(' · ') || 'Turn completed', ts }];
+            }
+
+            // done (synthetic from process_manager)
+            if (event_type === 'done' || type === 'done') {
+                const summary = event.summary || '';
+                const cost = event.cost != null ? ` · $${event.cost.toFixed(4)}` : '';
+                return [{ kind: 'done', label: 'Done', content: (summary || 'Completed') + cost, ts }];
+            }
+
+            // error
+            if (event_type === 'error' || type === 'error') {
+                return [{ kind: 'error', label: 'Error', content: event.message || event.error || content, ts }];
+            }
+
+            return [];
+        }
+
+        function renderConvItem(item) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'conv-message agent';
+
+            const meta = document.createElement('div');
+            meta.className = 'conv-meta';
+
+            const bubble = document.createElement('div');
+
+            switch (item.kind) {
+                case 'text': {
+                    const agentClass = item.agent === 'codex' ? 'codex' : 'claude';
+                    meta.innerHTML = `<span class="conv-label ${agentClass}">${escapeHtml(item.label)}</span><span>${item.ts}</span>`;
+                    bubble.className = 'conv-bubble text-bubble';
+                    bubble.textContent = item.content;
+                    break;
+                }
+                case 'tool_use': {
+                    const agentClass = item.agent === 'codex' ? 'codex' : 'claude';
+                    meta.innerHTML = `<span class="conv-label ${agentClass}">${escapeHtml(item.label)}</span><span class="conv-label tool">Tool Call</span><span>${item.ts}</span>`;
+                    bubble.className = 'conv-bubble tool-bubble';
+                    const nameEl = document.createElement('div');
+                    nameEl.className = 'tool-name';
+                    nameEl.textContent = item.toolName || '(unknown)';
+                    bubble.appendChild(nameEl);
+                    if (item.toolInput && Object.keys(item.toolInput).length > 0) {
+                        const inputEl = document.createElement('div');
+                        inputEl.className = 'tool-input';
+                        inputEl.textContent = JSON.stringify(item.toolInput, null, 2);
+                        bubble.appendChild(inputEl);
+                    }
+                    break;
+                }
+                case 'tool_result': {
+                    meta.innerHTML = `<span class="conv-label result">${escapeHtml(item.label)}</span><span>${item.ts}</span>`;
+                    bubble.className = `conv-bubble tool-result-bubble${item.isError ? ' error-bubble' : ''}`;
+                    bubble.textContent = item.content;
+                    break;
+                }
+                case 'done': {
+                    meta.innerHTML = `<span class="conv-label sys">${escapeHtml(item.label)}</span><span>${item.ts}</span>`;
+                    bubble.className = 'conv-bubble done-bubble';
+                    bubble.textContent = item.content;
+                    break;
+                }
+                case 'error': {
+                    meta.innerHTML = `<span class="conv-label" style="color:#f48771">${escapeHtml(item.label)}</span><span>${item.ts}</span>`;
+                    bubble.className = 'conv-bubble error-bubble';
+                    bubble.textContent = item.content;
+                    break;
+                }
+                case 'session_init': {
+                    meta.innerHTML = `<span class="conv-label sys">${escapeHtml(item.label)}</span><span>${item.ts}</span>`;
+                    bubble.className = 'conv-bubble session-bubble';
+                    bubble.textContent = item.content;
+                    break;
+                }
+                case 'stderr': {
+                    meta.innerHTML = `<span class="conv-label" style="color:#f48771">STDERR</span><span>${item.ts}</span>`;
+                    bubble.className = 'conv-bubble error-bubble';
+                    bubble.textContent = item.content;
+                    break;
+                }
+                default:
+                    return null;
+            }
+
+            wrapper.appendChild(meta);
+            wrapper.appendChild(bubble);
+            return wrapper;
+        }
+
+        // ── Raw log rendering (old style) ───────────────────────────────────────
+        function renderRawEntry(log) {
+            const { stream, content, event_type, timestamp } = log;
+            const line = document.createElement('div');
+            line.className = `log-line log-${stream}`;
+            const ts = timestamp ? `<span class="log-ts">[${formatTs(timestamp)}]</span> ` : '';
+            const lbl = event_type ? `<span class="log-prefix log-prefix-meta">${escapeHtml(event_type.toUpperCase())}</span> ` : '';
+            const err = stream === 'stderr' ? `<span class="log-prefix log-prefix-err">STDERR</span> ` : '';
+            line.innerHTML = ts + lbl + err + escapeHtml(content.slice(0, 500));
+            return line;
+        }
+
+        // ── Session loading ─────────────────────────────────────────────────────
+        function loadSessionLog(sessionId) {
+            currentSessionId = sessionId;
+            sessionLogs = [];
+
+            document.querySelectorAll('.session-item').forEach(el => {
+                el.classList.toggle('active', parseInt(el.dataset.sessionId) === sessionId);
+            });
+
+            document.getElementById('log-title').textContent = `Session #${sessionId}`;
+            document.getElementById('log-status').textContent = '加载中...';
+            document.getElementById('conv-content').innerHTML = '';
+            document.getElementById('raw-content').innerHTML = '';
+            document.getElementById('view-toggle').style.display = 'flex';
+
+            fetch(`/api/sessions/${sessionId}`)
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('log-status').textContent = `${(data.logs || []).length} 条记录`;
+                    for (const log of (data.logs || [])) {
+                        appendLog(log);
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('log-status').textContent = '加载失败';
+                });
+        }
+
+        function appendLog(log) {
+            sessionLogs.push(log);
+
+            // Conv view
+            const items = parseLogEntry(log);
+            const convEl = document.getElementById('conv-content');
+            for (const item of items) {
+                const el = renderConvItem(item);
+                if (el) {
+                    convEl.appendChild(el);
+                    convEl.scrollTop = convEl.scrollHeight;
+                }
+            }
+
+            // Raw view
+            const rawEl = document.getElementById('raw-content');
+            rawEl.appendChild(renderRawEntry(log));
+            rawEl.scrollTop = rawEl.scrollHeight;
+        }
+
+        // WebSocket (for live streaming during active sessions)
+        function handleMessage(data) {
+            if (data.type === 'sessions_list') renderSessions(data.sessions);
+            else if (data.type === 'session_log_chunk' && data.session_id === currentSessionId) appendLog(data);
+            else if (data.type === 'session_log_end' && data.session_id === currentSessionId)
+                document.getElementById('log-status').textContent = `${sessionLogs.length} 条记录`;
+        }
+
+        function initWebSocket(onReady) {
+            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+            ws.onopen = () => { if (onReady) onReady(); };
+            ws.onmessage = (e) => { try { handleMessage(JSON.parse(e.data)); } catch (_) {} };
+            ws.onclose = () => setTimeout(() => initWebSocket(null), 3000);
+        }
+
+        // ── Session sidebar ─────────────────────────────────────────────────────
+        async function loadSessions() {
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                renderSessions(data.sessions || []);
+            } catch (_) {
+                if (ws && ws.readyState === WebSocket.OPEN)
+                    ws.send(JSON.stringify({ type: 'get_sessions' }));
+            }
+        }
+
+        function renderSessions(sessions) {
+            const container = document.getElementById('session-groups');
+            if (!sessions || sessions.length === 0) {
+                container.innerHTML = '<p style="color:#666;font-size:12px;">暂无 session 记录</p>';
+                return;
+            }
+            container.innerHTML = '';
+
+            const rounds = {};
+            for (const s of sessions) {
+                const rn = s.round_number ?? 0;
+                (rounds[rn] = rounds[rn] || []).push(s);
+            }
+            const sortedRounds = Object.keys(rounds).map(Number).sort((a, b) => b - a);
+
+            for (const roundNum of sortedRounds) {
+                const group = document.createElement('div');
+                group.className = 'session-group';
+                const header = document.createElement('div');
+                header.className = 'session-group-header';
+                header.textContent = `Round ${roundNum}`;
+                group.appendChild(header);
+
+                for (const s of rounds[roundNum]) {
+                    const item = document.createElement('div');
+                    item.className = 'session-item';
+                    item.dataset.sessionId = s.id;
+                    if (s.id === currentSessionId) item.classList.add('active');
+                    const agentLabel = s.agent === 'codex' ? '🟠 Codex' : '🟣 Claude';
+                    const statusColor = s.status === 'completed' ? '#28a745' : s.status === 'error' ? '#dc3545' : '#ffc107';
+                    item.innerHTML = `
+                        <div style="font-weight:500;">${agentLabel}</div>
+                        <div style="display:flex;justify-content:space-between;margin-top:2px;">
+                            <span style="color:#999;font-size:11px;">#${s.id}</span>
+                            <span style="color:${statusColor};font-size:11px;">${s.status}</span>
+                        </div>`;
+                    item.addEventListener('click', () => loadSessionLog(s.id));
+                    group.appendChild(item);
+                }
+                container.appendChild(group);
+            }
+        }
+
+        // ── Utils ───────────────────────────────────────────────────────────────
+        function formatTs(ts) {
+            if (!ts) return '';
+            try { return new Date(ts).toLocaleTimeString(); } catch (_) { return String(ts); }
+        }
+        function escapeHtml(text) {
+            const d = document.createElement('div');
+            d.textContent = String(text);
+            return d.innerHTML;
+        }
+
+        // ── Init ────────────────────────────────────────────────────────────────
+        document.addEventListener('DOMContentLoaded', () => {
+            const params = new URLSearchParams(window.location.search);
+            const sessionId = params.get('session');
+            initWebSocket(() => {
+                loadSessions();
+                if (sessionId) loadSessionLog(parseInt(sessionId));
+            });
+        });
+    </script>
+</body>
+</html>

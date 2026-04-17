@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent 团队协作</title>
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<div class="app-layout">
+
+    <!-- ===== Left: Project Header + Session Sidebar ===== -->
+    <aside class="conv-sidebar">
+        <!-- Project Header -->
+        <div class="project-header">
+            <div class="project-title" id="project-title">未选择项目</div>
+            <div class="project-actions">
+                <button type="button" id="switch-conv-btn" title="切换项目">切换</button>
+                <button type="button" id="rename-conv-btn" title="改名">改名</button>
+                <button type="button" id="new-conv-btn" title="新建项目">新建</button>
+            </div>
+        </div>
+
+        <!-- Sessions section (current project only) -->
+        <div class="sidebar-section sessions">
+            <div class="sidebar-section-header">
+                <span>运行记录</span>
+            </div>
+            <div class="sidebar-list" id="session-sidebar-list">
+                <!-- Populated by app.js -->
+            </div>
+            <div class="sidebar-pagination" id="session-pagination" style="display:none">
+                <button type="button" id="session-page-prev" disabled>‹</button>
+                <span id="session-page-info">1 / 1</span>
+                <button type="button" id="session-page-next" disabled>›</button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- ===== Middle: Chat / Session View ===== -->
+    <main class="chat-main" id="chat-main">
+        <!-- Header -->
+        <header class="chat-header">
+            <h1 id="chat-title">Agent 团队协作</h1>
+            <div class="control-panel">
+                <span id="connection-status" class="connection-status disconnected">
+                    <span class="status-dot"></span> 断开
+                </span>
+                <span id="round-counter">Round 0</span>
+                <span id="status">空闲</span>
+                <button type="button" id="start-btn">开始</button>
+                <button type="button" id="retry-btn" disabled>重试</button>
+                <button type="button" id="stop-btn" disabled>立即停止</button>
+                <button type="button" id="stop-after-btn" disabled>完成后停止</button>
+            </div>
+        </header>
+
+        <!-- Intervention Banner (hidden by default) -->
+        <div id="intervention-banner" class="intervention-banner hidden">
+            <span id="intervention-message">等待用户输入...</span>
+            <span id="countdown">30</span>秒
+            <button type="button" id="skip-btn">跳过等待</button>
+        </div>
+
+        <!-- Session View Header (back button, shown when viewing a session) -->
+        <div id="session-view-header" class="session-view-header hidden">
+            <button type="button" class="back-btn" id="back-btn">← 返回</button>
+            <span class="session-view-title" id="session-view-title">会话日志</span>
+        </div>
+
+        <!-- Chat Messages -->
+        <div id="messages" class="messages-area">
+            <div class="message message-system">
+                <div class="message-header"><span class="role">系统</span></div>
+                <div class="message-content">
+                    欢迎使用 Agent 团队协作系统。<br>
+                    左侧新建会话，右侧配置 Agent 流程，点击「开始」启动自动化循环。
+                </div>
+            </div>
+        </div>
+
+        <!-- Session View (conversation bubbles, replaces messages area) -->
+        <div id="session-view" class="session-view-area"></div>
+
+        <!-- Input Area -->
+        <footer class="input-area">
+            <input type="text" id="message-input" placeholder="输入意见... (Enter 发送)" />
+            <button type="button" id="send-btn">发送</button>
+        </footer>
+    </main>
+
+    <!-- ===== Right: Pipeline Config Panel ===== -->
+    <aside class="pipeline-panel" id="pipeline-panel">
+        <div class="pipeline-header">
+            <h3>Agent 流程</h3>
+            <div class="pipeline-conv-name" id="pipeline-conv-name">未选择会话</div>
+        </div>
+
+        <div class="pipeline-workdir" id="pipeline-workdir" style="display:none">
+            <label>工作目录（所有步骤共用）</label>
+            <input type="text" id="pipeline-workdir-input" placeholder="e.g. E:\AI\project..." />
+        </div>
+
+        <div class="pipeline-steps-list" id="pipeline-steps-list">
+            <div class="pipeline-no-conv" id="pipeline-no-conv">
+                请先在左侧选择或新建会话
+            </div>
+        </div>
+
+        <div class="pipeline-actions" id="pipeline-actions" style="display:none">
+            <button type="button" class="btn-add-step" id="add-step-btn">+ 添加步骤</button>
+            <button type="button" class="btn-save-pipeline" id="save-pipeline-btn">保存流程</button>
+        </div>
+    </aside>
+
+</div>
+<!-- Conversation Switcher Modal -->
+<div id="conv-modal" class="conv-modal hidden">
+    <div class="conv-modal-backdrop" id="conv-modal-backdrop"></div>
+    <div class="conv-modal-content">
+        <div class="conv-modal-header">
+            <span>切换项目</span>
+            <button type="button" id="conv-modal-close">×</button>
+        </div>
+        <div id="conv-modal-list" class="conv-modal-list">
+            <!-- Populated by app.js -->
+        </div>
+        <div class="conv-modal-footer">
+            <button type="button" id="conv-modal-new">+ 新建项目</button>
+        </div>
+    </div>
+</div>
+
+<script src="static/app.js"></script>
+</body>
+</html>
