@@ -435,19 +435,21 @@ class AgentProcess:
 
 
 class ProcessManager:
-    """Central manager for all agent processes."""
+    """Central manager for all agent processes. Supports concurrent parallel runs."""
 
     def __init__(self):
-        self._active_process: Optional[AgentProcess] = None
+        self._active_processes: list[AgentProcess] = []
 
     @property
     def is_running(self) -> bool:
-        return self._active_process is not None and self._active_process.is_running()
+        return any(p.is_running() for p in self._active_processes)
 
     def get_status(self) -> Optional[ProcessStatus]:
-        """Return current process status for UI display."""
-        if self._active_process:
-            return self._active_process.get_status()
+        """Return status of the first running process (for backward compat)."""
+        for p in self._active_processes:
+            s = p.get_status()
+            if s:
+                return s
         return None
 
     async def start_agent(
@@ -457,13 +459,10 @@ class ProcessManager:
         session_id: Optional[str] = None,
         working_dir_override: Optional[str] = None
     ) -> AsyncIterator[AgentOutput]:
-        """Start an agent and stream its output."""
-        if self.is_running:
-            raise RuntimeError("Another agent is already running")
-
+        """Start an agent and stream its output. Multiple concurrent calls are allowed."""
         command = AGENT_COMMANDS.get(agent_name, agent_name)
         process = AgentProcess(agent_name, command, working_dir=working_dir_override or '.')
-        self._active_process = process
+        self._active_processes.append(process)
 
         try:
             await process.start(
@@ -490,13 +489,14 @@ class ProcessManager:
             )
 
         finally:
-            self._active_process = None
+            self._active_processes = [p for p in self._active_processes if p is not process]
 
     async def stop_current(self) -> None:
-        if self._active_process:
-            await self._active_process.stop()
+        """Stop all currently running agent processes."""
+        await asyncio.gather(*[p.stop() for p in self._active_processes], return_exceptions=True)
 
     def get_current_session_id(self) -> Optional[str]:
-        if self._active_process:
-            return self._active_process.session_id
+        for p in self._active_processes:
+            if p.session_id:
+                return p.session_id
         return None

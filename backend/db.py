@@ -55,7 +55,8 @@ class Database:
                 conversation_id INTEGER NOT NULL,
                 step_order      INTEGER NOT NULL,
                 agent_type      TEXT NOT NULL,
-                prompt_template TEXT
+                prompt_template TEXT,
+                is_async        INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -83,6 +84,14 @@ class Database:
                 await self._db.commit()
             except Exception:
                 pass  # column already exists
+
+        try:
+            await self._db.execute(
+                "ALTER TABLE pipeline_steps ADD COLUMN is_async INTEGER DEFAULT 0"
+            )
+            await self._db.commit()
+        except Exception:
+            pass
 
         # Ensure a default conversation exists for any legacy data
         cursor = await self._db.execute("SELECT COUNT(*) FROM conversations")
@@ -186,9 +195,10 @@ class Database:
             )
             for i, step in enumerate(steps):
                 await self._db.execute(
-                    "INSERT INTO pipeline_steps (conversation_id, step_order, agent_type, prompt_template)"
-                    " VALUES (?, ?, ?, ?)",
-                    (conv_id, i, step.get('agent_type', 'claude'), step.get('prompt_template')),
+                    "INSERT INTO pipeline_steps (conversation_id, step_order, agent_type, prompt_template, is_async)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (conv_id, i, step.get('agent_type', 'claude'), step.get('prompt_template'),
+                     1 if step.get('is_async') else 0),
                 )
             await self._db.commit()
 
@@ -353,45 +363,30 @@ class Database:
         return [r[0] for r in rows]
 
     async def get_recent_summaries(self, conv_id: int, limit: int = 3) -> list:
+        """Return context for the last `limit` agent sessions, including any user messages in between.
+
+        Finds the ID of the Nth-from-last agent session, then returns all rows
+        (agent + user) with id >= that threshold, oldest-first.
         """
-        Return all sessions after the Nth-from-last agent session (inclusive).
-
-        Find the ID of the (N)th most recent agent session, then return all
-        sessions (both user and agent) with id >= that threshold.
-
-        Example for limit=3:
-        - Agent sessions: [..., id=10, id=15, id=20, id=25, id=30]
-        - 3rd from last = id=20
-        - Return: all records with id >= 20 (user + agent mixed)
-
-        Returns list of { role, content, timestamp } ordered oldest-first.
-        """
-        # Find the ID of the Nth most recent agent session
         cur = await self._db.execute(
             "SELECT id FROM sessions"
-            " WHERE conv_id = ? AND agent_type != 'user'"
+            " WHERE conv_id = ? AND agent_type != 'user' AND chat IS NOT NULL"
             " ORDER BY id DESC LIMIT 1 OFFSET ?",
-            (conv_id, limit - 1),  # OFFSET 2 = 3rd from last
+            (conv_id, limit - 1),
         )
         threshold_row = await cur.fetchone()
 
         if not threshold_row:
-            # Less than N agent sessions, return all
             cur = await self._db.execute(
                 "SELECT agent_type as role, chat as content, created_at as timestamp"
-                " FROM sessions"
-                " WHERE conv_id = ? AND chat IS NOT NULL"
-                " ORDER BY id ASC",
+                " FROM sessions WHERE conv_id = ? AND chat IS NOT NULL ORDER BY id ASC",
                 (conv_id,),
             )
         else:
-            threshold_id = threshold_row[0]
             cur = await self._db.execute(
                 "SELECT agent_type as role, chat as content, created_at as timestamp"
-                " FROM sessions"
-                " WHERE conv_id = ? AND id >= ? AND chat IS NOT NULL"
-                " ORDER BY id ASC",
-                (conv_id, threshold_id),
+                " FROM sessions WHERE conv_id = ? AND id >= ? AND chat IS NOT NULL ORDER BY id ASC",
+                (conv_id, threshold_row[0]),
             )
 
         return [dict(r) for r in await cur.fetchall()]

@@ -123,6 +123,7 @@ class RoundController:
 
         self._stop_requested     = False
         self._stop_after_current = False
+        self._one_round_only     = False
         self._lock               = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -151,6 +152,7 @@ class RoundController:
 
             self._stop_requested     = False
             self._stop_after_current = False
+            self._one_round_only     = False
 
             steps = []
             working_dir = None
@@ -215,6 +217,7 @@ class RoundController:
 
             self._stop_requested     = False
             self._stop_after_current = False
+            self._one_round_only     = False
 
             if self.current_round.round_index == 0:
                 # No in-memory state — restore from DB
@@ -246,28 +249,30 @@ class RoundController:
             asyncio.create_task(self.run_loop())
             return True
 
-    async def retry(self, conversation_id: Optional[int] = None) -> bool:
-        """Re-run the current step without advancing. Creates a fresh session row.
+    async def start_new_round(self, conversation_id: Optional[int] = None) -> bool:
+        """Start a fresh round from step 1, advancing the round counter.
 
         Returns True if accepted.
         """
         async with self._lock:
             if self.state == RoundState.RUNNING:
-                log.warning("Cannot retry: already running")
+                log.warning("Cannot start new round: already running")
                 return False
 
             self._stop_requested     = False
             self._stop_after_current = False
+            self._one_round_only     = True
 
             if self.current_round.round_index == 0:
                 conv_id = conversation_id or self.current_round.conversation_id
-                if not conv_id or not await self._restore_from_db(conv_id, for_retry=True):
-                    await self.broadcast({'type': 'system', 'content': '没有可重试的步骤'})
+                if not conv_id or not await self._restore_from_db(conv_id, for_retry=False):
+                    await self.broadcast({'type': 'system', 'content': '没有可继续的流程'})
                     return False
 
-            # Clear resume_id and session_pk so _run_step creates a fresh row
-            self.current_round.resume_id  = None
-            self.current_round.session_pk = None
+            self.current_round.round_index += 1
+            self.current_round.step_index   = 1
+            self.current_round.resume_id    = None
+            self.current_round.session_pk   = None
 
             self.state = RoundState.RUNNING
             await self._broadcast_status()
@@ -333,69 +338,154 @@ class RoundController:
     # Main loop
     # ------------------------------------------------------------------
 
-    async def run_loop(self) -> None:
-        """Run one pipeline step, then open an intervention window.
+    def _make_batches(self) -> list:
+        """Group pipeline steps into execution batches.
 
-        For automated multi-step runs (no intervention timeout) this loops
-        through all steps without pausing.
+        Consecutive async steps form one parallel batch; each sync step is its own batch.
+        Each batch is a list of (step_index_1based, step_dict).
         """
+        steps = self.current_round.pipeline_steps
+        batches: list = []
+        async_batch: list = []
+        for i, step in enumerate(steps):
+            si = i + 1
+            if step.get('is_async'):
+                async_batch.append((si, step))
+            else:
+                if async_batch:
+                    batches.append(async_batch)
+                    async_batch = []
+                batches.append([(si, step)])
+        if async_batch:
+            batches.append(async_batch)
+        return batches
+
+    async def run_loop(self) -> None:
+        """Run pipeline steps in batches, looping across rounds."""
         try:
             while True:
                 if self._stop_requested:
                     break
 
-                step = self._current_step()
-                if step is None:
+                batches = self._make_batches()
+                current_si = self.current_round.step_index
+
+                # Find the starting batch for this round
+                start_bi = 0
+                for bi, batch in enumerate(batches):
+                    if any(si == current_si for si, _ in batch):
+                        start_bi = bi
+                        break
+
+                # Capture initial resume state (for resume_session flows)
+                init_resume_id  = self.current_round.resume_id
+                init_session_pk = self.current_round.session_pk
+                init_step_si    = self.current_round.step_index
+
+                if not batches:
                     break
 
-                api_error = await self._run_step(step)
-
-                if self._stop_requested or self._stop_after_current:
-                    break
-
-                if api_error:
-                    retries_left = self.current_round.api_err_retries
-                    retry_count = 0
-                    while api_error and retry_count < retries_left:
-                        retry_count += 1
-                        await self.broadcast({
-                            'type': 'system',
-                            'content': f'API 错误，60 秒后重试 ({retry_count}/{retries_left})...',
-                        })
-                        await asyncio.sleep(60)
-                        if self._stop_requested:
-                            break
-                        self.current_round.user_inputs = ['继续']
-                        api_error = await self._run_step(step)
-                        if self._stop_requested or self._stop_after_current:
-                            break
+                round_done = True
+                for bi in range(start_bi, len(batches)):
                     if self._stop_requested or self._stop_after_current:
-                        break
-                    if api_error:
-                        await self.broadcast({
-                            'type': 'system',
-                            'content': f'API 错误重试已达上限 ({retries_left} 次)，停止流程',
-                        })
+                        round_done = False
                         break
 
-                # Advance to next step
-                next_step = self.current_round.step_index + 1
-                if next_step > len(self.current_round.pipeline_steps):
-                    # All steps done — check max_rounds, then start next round
-                    max_rounds = self.current_round.max_rounds
-                    if max_rounds > 0 and self.current_round.round_index >= max_rounds:
-                        await self.broadcast({
-                            'type': 'system',
-                            'content': f'已达最大轮次 {max_rounds}，自动停止',
-                        })
-                        break
-                    self.current_round.round_index += 1
-                    self.current_round.step_index   = 1
-                else:
-                    self.current_round.step_index = next_step
+                    batch = batches[bi]
+                    self.current_round.step_index = batch[0][0]
+                    self.current_round.resume_id  = None
+                    self.current_round.session_pk = None
+                    await self._broadcast_status()
 
-                self.current_round.resume_id  = None
-                self.current_round.session_pk = None
+                    # Run all steps in this batch (parallel if >1).
+                    # return_exceptions=True: one step failing doesn't cancel the others.
+                    raw_results = await asyncio.gather(
+                        *[
+                            self._run_step(
+                                step, si,
+                                resume_id=init_resume_id if si == init_step_si else None,
+                                session_pk=init_session_pk if si == init_step_si else None,
+                            )
+                            for si, step in batch
+                        ],
+                        return_exceptions=True,
+                    )
+
+                    # Separate successful results from exceptions
+                    step_results = []
+                    for (si, step), result in zip(batch, raw_results):
+                        if isinstance(result, Exception):
+                            log.error(f"Step {si} raised: {result}")
+                            await self.broadcast({'type': 'system', 'content': f'步骤 {si} 错误: {result}'})
+                            step_results.append(((si, step), (True, None)))
+                        else:
+                            step_results.append(((si, step), result))
+
+                    if self._stop_requested or self._stop_after_current:
+                        round_done = False
+                        break
+
+                    # Retry steps that had API errors
+                    failed = [(si, step, rid) for (si, step), (err, rid) in step_results if err]
+                    if failed:
+                        retries_left = self.current_round.api_err_retries
+                        retry_count = 0
+                        while failed and retry_count < retries_left:
+                            retry_count += 1
+                            await self.broadcast({
+                                'type': 'system',
+                                'content': f'API 错误，60 秒后重试 ({retry_count}/{retries_left})...',
+                            })
+                            await asyncio.sleep(60)
+                            if self._stop_requested:
+                                break
+                            self.current_round.user_inputs = ['继续']
+                            retry_raw = await asyncio.gather(
+                                *[self._run_step(step, si, resume_id=rid) for si, step, rid in failed],
+                                return_exceptions=True,
+                            )
+                            new_failed = []
+                            for (si, step, _), r in zip(failed, retry_raw):
+                                if isinstance(r, Exception) or r[0]:
+                                    new_failed.append((si, step, None if isinstance(r, Exception) else r[1]))
+                            failed = new_failed
+                            if self._stop_requested or self._stop_after_current:
+                                break
+
+                        if self._stop_requested or self._stop_after_current:
+                            round_done = False
+                            break
+                        if failed:
+                            await self.broadcast({
+                                'type': 'system',
+                                'content': f'API 错误重试已达上限 ({retries_left} 次)，停止流程',
+                            })
+                            round_done = False
+                            break
+
+                    self.current_round.step_index = batch[-1][0]
+                    self.current_round.resume_id  = None
+                    self.current_round.session_pk = None
+
+                if not round_done:
+                    break
+
+                if self._stop_after_current or self._one_round_only:
+                    break
+
+                # All batches in this round done — check max_rounds and advance
+                max_rounds = self.current_round.max_rounds
+                if max_rounds > 0 and self.current_round.round_index >= max_rounds:
+                    await self.broadcast({
+                        'type': 'system',
+                        'content': f'已达最大轮次 {max_rounds}，自动停止',
+                    })
+                    break
+
+                self.current_round.round_index += 1
+                self.current_round.step_index   = 1
+                self.current_round.resume_id    = None
+                self.current_round.session_pk   = None
 
         except Exception as e:
             log.exception(f"Error in run_loop: {e}")
@@ -409,27 +499,24 @@ class RoundController:
     # Step execution
     # ------------------------------------------------------------------
 
-    async def _run_step(self, step: dict) -> bool:
+    async def _run_step(self, step: dict, step_index: int,
+                        resume_id: Optional[str] = None,
+                        session_pk: Optional[int] = None) -> tuple:
         """Create a session row and run the agent for one pipeline step.
 
-        Returns True if the session ended due to an API error.
+        Returns (api_error: bool, resume_id: str|None).
+        resume_id is the CLI session ID captured during this run (for retries).
         """
         agent_type    = step.get('agent_type', 'claude')
         conv_id       = self.current_round.conversation_id
         round_index   = self.current_round.round_index
-        step_index    = self.current_round.step_index
-        resume_id     = self.current_round.resume_id
 
-        # Resume if we have resume_id (API error retry) or explicit session_pk (resume_session)
-        is_resuming   = resume_id is not None or self.current_round.session_pk is not None
+        is_resuming = resume_id is not None or session_pk is not None
 
         if not is_resuming:
-            # Create a fresh session row
-            self.current_round.session_pk = await self.db.create_session(
+            session_pk = await self.db.create_session(
                 conv_id, round_index, step_index, agent_type
             )
-
-        session_pk = self.current_round.session_pk
 
         # Broadcast status so frontend updates Round N-M display
         await self._broadcast_status()
@@ -456,7 +543,7 @@ class RoundController:
             ),
         })
 
-        prompt    = await self._build_prompt(step)
+        prompt    = await self._build_prompt(step, resume_id=resume_id)
         cwd       = self.current_round.working_dir
         summary   = None
         text_buf: list = []
@@ -552,7 +639,7 @@ class RoundController:
                                 or (data.get('subtype') == 'init' and data.get('session_id'))
                             )
                             if cli_id and isinstance(cli_id, str):
-                                self.current_round.resume_id = cli_id
+                                resume_id = cli_id
                                 await self.db.update_session_id(session_pk, cli_id)
                         except Exception:
                             pass
@@ -574,7 +661,7 @@ class RoundController:
                             summary = data.get('summary')
                             cli_id  = data.get('session_id') or data.get('thread_id')
                             if cli_id:
-                                self.current_round.resume_id = cli_id
+                                resume_id = cli_id
                                 await self.db.update_session_id(session_pk, cli_id)
                         except Exception:
                             pass
@@ -593,7 +680,7 @@ class RoundController:
             # If summary is empty, try to extract from JSONL file
             if not summary:
                 from . import session_reader
-                cli_id = self.current_round.resume_id
+                cli_id = resume_id
                 if cli_id:
                     extracted = session_reader.extract_session_summary(agent_type, cli_id)
                     if extracted:
@@ -617,11 +704,7 @@ class RoundController:
             'timestamp':       datetime.now().isoformat(),
         })
 
-        # Clear session_pk so the next step creates a fresh row
-        # (unless we're about to resume due to API error — in that case, keep resume_id)
-        self.current_round.session_pk = None
-
-        return api_error
+        return api_error, resume_id
 
     # ------------------------------------------------------------------
     # Prompt builder
@@ -644,13 +727,13 @@ class RoundController:
             lines.append(f'**{role}** [{time_str}]: {r.get("content") or ""}')
         return '\n'.join(lines)
 
-    async def _build_prompt(self, step: dict) -> str:
+    async def _build_prompt(self, step: dict, resume_id: Optional[str] = None) -> str:
         agent_type      = step.get('agent_type', 'claude')
         custom_template = step.get('prompt_template')
         conv_id         = self.current_round.conversation_id
 
         # When resuming, the agent already has session memory — just return user input
-        if self.current_round.resume_id:
+        if resume_id:
             user_input = '继续'
             if self.current_round.user_inputs:
                 user_input = '\n'.join(f'- {u}' for u in self.current_round.user_inputs)

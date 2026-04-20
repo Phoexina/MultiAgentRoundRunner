@@ -461,12 +461,13 @@ class PipelinePanel {
         // Pre-fill default templates if steps have empty/null templates
         this.steps = steps.length ? steps.map(s => ({
             agent_type: s.agent_type,
+            is_async: !!s.is_async,
             prompt_template: (s.prompt_template && s.prompt_template.trim())
                 ? s.prompt_template
                 : this.defaultTemplate,
         })) : [
-            { agent_type: 'codex',  prompt_template: this.defaultTemplate },
-            { agent_type: 'claude', prompt_template: this.defaultTemplate },
+            { agent_type: 'codex',  is_async: false, prompt_template: this.defaultTemplate },
+            { agent_type: 'claude', is_async: false, prompt_template: this.defaultTemplate },
         ];
         this.$header.textContent = convName;
         this.$convConfig.style.display = 'block';
@@ -484,7 +485,7 @@ class PipelinePanel {
     _addStep() {
         const lastAgent = this.steps.length > 0 ? this.steps[this.steps.length - 1].agent_type : 'claude';
         const newAgent = lastAgent === 'codex' ? 'claude' : 'codex';
-        this.steps.push({ agent_type: newAgent, prompt_template: this.defaultTemplate });
+        this.steps.push({ agent_type: newAgent, is_async: false, prompt_template: this.defaultTemplate });
         this._render();
     }
 
@@ -509,11 +510,17 @@ class PipelinePanel {
                     <option value="codex"  ${step.agent_type === 'codex'  ? 'selected' : ''}>Codex</option>
                     <option value="claude" ${step.agent_type === 'claude' ? 'selected' : ''}>Claude</option>
                 </select>
+                <label class="step-async-label" title="与前后相邻的异步步骤并行执行">
+                    <input type="checkbox" class="step-async-cb" ${step.is_async ? 'checked' : ''}>异步
+                </label>
                 <button class="step-prompt-btn ${hasCustom ? 'has-custom' : ''}" title="${hasCustom ? '已自定义提示词' : '使用默认模板'}">提示词</button>
                 <button class="step-del-btn" title="删除步骤">×</button>
             `;
             el.querySelector('.step-agent-select').addEventListener('change', (e) => {
                 this.steps[i].agent_type = e.target.value;
+            });
+            el.querySelector('.step-async-cb').addEventListener('change', (e) => {
+                this.steps[i].is_async = e.target.checked;
             });
             el.querySelector('.step-prompt-btn').addEventListener('click', () => {
                 this._openPromptModal(i);
@@ -575,6 +582,7 @@ class PipelinePanel {
         if (!this.currentConvId) return;
         const steps = this.steps.map(s => ({
             agent_type: s.agent_type,
+            is_async: s.is_async || false,
             prompt_template: s.prompt_template || null,
         }));
         this.ws.send({
@@ -864,7 +872,7 @@ class ChatUI {
         this.$input = document.getElementById('message-input');
         this.$sendBtn = document.getElementById('send-btn');
         this.$startBtn = document.getElementById('start-btn');
-        this.$retryBtn = document.getElementById('retry-btn');
+        this.$startRoundBtn = document.getElementById('start-round-btn');
         this.$stopBtn = document.getElementById('stop-btn');
         this.$stopAfterBtn = document.getElementById('stop-after-btn');
         this.$status = document.getElementById('status');
@@ -888,8 +896,8 @@ class ChatUI {
             const action = this.hasHistory ? 'continue' : 'start';
             ws.send({ type: 'control', action, conversation_id: this.currentConvId });
         });
-        this.$retryBtn.addEventListener('click', () => {
-            ws.send({ type: 'control', action: 'retry', conversation_id: this.currentConvId });
+        this.$startRoundBtn.addEventListener('click', () => {
+            ws.send({ type: 'control', action: 'start_round', conversation_id: this.currentConvId });
         });
         this.$stopBtn.addEventListener('click', () => {
             ws.send({ type: 'control', action: 'stop' });
@@ -1239,7 +1247,7 @@ class ChatUI {
         this.$startBtn.textContent = (!this.hasHistory && s === 'idle') ? '开始' : '继续';
         this.$startBtn.disabled = isRunning;
         // Retry requires having a prior round to repeat
-        this.$retryBtn.disabled = !canAct || !this.hasHistory;
+        this.$startRoundBtn.disabled = isRunning;
         this.$stopBtn.disabled = !isRunning;
         this.$stopAfterBtn.disabled = !isRunning;
     }

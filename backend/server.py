@@ -380,8 +380,8 @@ class ChatServer:
         elif action == 'continue':
             await self.round_controller.continue_next(conversation_id=conversation_id)
 
-        elif action == 'retry':
-            await self.round_controller.retry(conversation_id=conversation_id)
+        elif action == 'start_round':
+            await self.round_controller.start_new_round(conversation_id=conversation_id)
 
     async def _handle_get_sessions(
         self, websocket: WebSocketServerProtocol,
