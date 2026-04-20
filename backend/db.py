@@ -42,10 +42,12 @@ class Database:
     async def _create_tables(self) -> None:
         await self._db.executescript("""
             CREATE TABLE IF NOT EXISTS conversations (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT NOT NULL,
-                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-                working_dir TEXT
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                working_dir     TEXT,
+                max_rounds      INTEGER DEFAULT 0,
+                api_err_retries INTEGER DEFAULT 3
             );
 
             CREATE TABLE IF NOT EXISTS pipeline_steps (
@@ -71,6 +73,16 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_sess_round ON sessions(conv_id, round_index, step_index);
             CREATE INDEX IF NOT EXISTS idx_pipe_conv  ON pipeline_steps(conversation_id);
         """)
+
+        # Migrate existing DB: add new columns if absent
+        for col, default in [('max_rounds', 0), ('api_err_retries', 3)]:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE conversations ADD COLUMN {col} INTEGER DEFAULT {default}"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # column already exists
 
         # Ensure a default conversation exists for any legacy data
         cursor = await self._db.execute("SELECT COUNT(*) FROM conversations")
@@ -153,12 +165,21 @@ class Database:
         conv_id: int,
         steps: list,
         working_dir: Optional[str] = None,
+        max_rounds: Optional[int] = None,
+        api_err_retries: Optional[int] = None,
     ) -> None:
         async with self._lock:
+            updates, params = [], []
             if working_dir is not None:
+                updates.append("working_dir = ?"); params.append(working_dir)
+            if max_rounds is not None:
+                updates.append("max_rounds = ?"); params.append(max_rounds)
+            if api_err_retries is not None:
+                updates.append("api_err_retries = ?"); params.append(api_err_retries)
+            if updates:
+                params.append(conv_id)
                 await self._db.execute(
-                    "UPDATE conversations SET working_dir = ? WHERE id = ?",
-                    (working_dir, conv_id)
+                    f"UPDATE conversations SET {', '.join(updates)} WHERE id = ?", params
                 )
             await self._db.execute(
                 "DELETE FROM pipeline_steps WHERE conversation_id = ?", (conv_id,)
@@ -317,16 +338,19 @@ class Database:
         rows = [dict(r) for r in await cur.fetchall()]
         return list(reversed(rows))   # oldest first
 
-    async def get_latest_user_message(self, conv_id: int) -> Optional[str]:
-        """Return the most recent user message content for a conversation, or None."""
+    async def get_latest_user_message(self, conv_id: int, limit: int = 1) -> list:
+        """Return the most recent user message(s) content for a conversation.
+
+        Returns list of strings ordered newest-first. Empty list if none.
+        """
         cur = await self._db.execute(
             "SELECT chat FROM sessions"
             " WHERE conv_id = ? AND agent_type = 'user' AND chat IS NOT NULL"
-            " ORDER BY id DESC LIMIT 1",
-            (conv_id,),
+            " ORDER BY id DESC LIMIT ?",
+            (conv_id, limit),
         )
-        row = await cur.fetchone()
-        return row[0] if row else None
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
 
     async def get_recent_summaries(self, conv_id: int, limit: int = 3) -> list:
         """

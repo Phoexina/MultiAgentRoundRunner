@@ -425,10 +425,15 @@ class PipelinePanel {
         this.ws = ws;
         this.currentConvId = null;
         this.workingDir = '';
+        this.maxRounds = 0;
+        this.apiErrRetries = 3;
         this.steps = [];
         this.defaultTemplate = '';
 
         this.$header = document.getElementById('pipeline-conv-name');
+        this.$convConfig = document.getElementById('pipeline-conv-config');
+        this.$maxRoundsInput = document.getElementById('conv-max-rounds');
+        this.$apiRetriesInput = document.getElementById('conv-api-retries');
         this.$workdirSection = document.getElementById('pipeline-workdir');
         this.$workdirInput = document.getElementById('pipeline-workdir-input');
         this.$list = document.getElementById('pipeline-steps-list');
@@ -437,9 +442,9 @@ class PipelinePanel {
         this.$addBtn = document.getElementById('add-step-btn');
         this.$saveBtn = document.getElementById('save-pipeline-btn');
 
-        this.$workdirInput.addEventListener('input', (e) => {
-            this.workingDir = e.target.value;
-        });
+        this.$workdirInput.addEventListener('input', (e) => { this.workingDir = e.target.value; });
+        this.$maxRoundsInput.addEventListener('input', (e) => { this.maxRounds = parseInt(e.target.value) || 0; });
+        this.$apiRetriesInput.addEventListener('input', (e) => { this.apiErrRetries = parseInt(e.target.value) || 0; });
         this.$addBtn.addEventListener('click', () => this._addStep());
         this.$saveBtn.addEventListener('click', () => this._save());
     }
@@ -448,9 +453,11 @@ class PipelinePanel {
         this.defaultTemplate = template || '';
     }
 
-    load(convId, convName, steps, workingDir) {
+    load(convId, convName, steps, workingDir, maxRounds, apiErrRetries) {
         this.currentConvId = convId;
         this.workingDir = workingDir || '';
+        this.maxRounds = (maxRounds != null) ? maxRounds : 0;
+        this.apiErrRetries = (apiErrRetries != null) ? apiErrRetries : 3;
         // Pre-fill default templates if steps have empty/null templates
         this.steps = steps.length ? steps.map(s => ({
             agent_type: s.agent_type,
@@ -462,6 +469,9 @@ class PipelinePanel {
             { agent_type: 'claude', prompt_template: this.defaultTemplate },
         ];
         this.$header.textContent = convName;
+        this.$convConfig.style.display = 'block';
+        this.$maxRoundsInput.value = this.maxRounds;
+        this.$apiRetriesInput.value = this.apiErrRetries;
         this.$workdirSection.style.display = 'block';
         this.$workdirInput.value = this.workingDir;
         this.$noConv.style.display = 'none';
@@ -571,6 +581,8 @@ class PipelinePanel {
             type: 'save_pipeline',
             conversation_id: this.currentConvId,
             working_dir: this.workingDir || null,
+            max_rounds: this.maxRounds,
+            api_err_retries: this.apiErrRetries,
             steps
         });
         this.$saveBtn.textContent = '已保存 ✓';
@@ -1372,7 +1384,7 @@ class App {
                 if (msg.default_prompt_template) {
                     this.pipeline.setDefaultTemplate(msg.default_prompt_template);
                 }
-                this.pipeline.load(msg.id, convName, msg.pipeline || [], msg.working_dir);
+                this.pipeline.load(msg.id, convName, msg.pipeline || [], msg.working_dir, msg.max_rounds, msg.api_err_retries);
                 // Load sessions for this conversation only
                 const sessions = msg.sessions || [];
                 this.sidebar.setSessions(sessions, msg.page || 0, msg.total_pages || 1);

@@ -96,6 +96,20 @@
             <div class="pipeline-conv-name" id="pipeline-conv-name">未选择会话</div>
         </div>
 
+        <!-- Session-level config: max rounds + API error retries -->
+        <div class="pipeline-conv-config" id="pipeline-conv-config" style="display:none">
+            <div class="conv-config-row">
+                <label>最大轮次</label>
+                <input type="number" id="conv-max-rounds" min="0" step="1" value="0" placeholder="0=无限" style="width:70px" />
+                <span class="conv-config-hint">0=无限</span>
+            </div>
+            <div class="conv-config-row">
+                <label>API错误重试</label>
+                <input type="number" id="conv-api-retries" min="0" step="1" value="3" placeholder="次" style="width:70px" />
+                <span class="conv-config-hint">次</span>
+            </div>
+        </div>
+
         <div class="pipeline-workdir" id="pipeline-workdir" style="display:none">
             <label>工作目录（所有步骤共用）</label>
             <input type="text" id="pipeline-workdir-input" placeholder="e.g. E:\AI\project..." />

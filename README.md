@@ -2,7 +2,16 @@
 
 多 Agent 回合制循环执行框架，支持用户随时介入。将多个 AI Agent（如 Codex CLI、Claude Code）组织为可配置的 Pipeline，自动循环执行任务，并通过 Web 界面实时监控每个 Agent 的运行过程。
 
-## 1. 快速开始
+
+
+![](./example/images/image-marr-user.png)
+
+![](./example/images/image-muti-agent.png)
+
+![](./example/images/image-agent-sesssion.png)
+
+
+## 快速开始
 
 ### 安装依赖
 

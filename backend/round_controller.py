@@ -10,6 +10,7 @@ Core rule: only opening a new session changes the Round.
 
 import asyncio
 import json
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Callable, Optional, Awaitable
@@ -17,8 +18,6 @@ from dataclasses import dataclass, field
 
 import logging
 log = logging.getLogger(__name__)
-
-MAX_ROUNDS = 0  # 0 = unlimited
 
 DEFAULT_PROMPT_TEMPLATE = """\
 ## 对话历史
@@ -96,6 +95,8 @@ class RoundData:
     working_dir:     Optional[str]  = None
     resume_id:       Optional[str]  = None    # cli_session_id for explicit --resume
     user_inputs:     list           = field(default_factory=list)  # intervention messages
+    max_rounds:      int            = 0       # 0 = unlimited
+    api_err_retries: int            = 3       # retries on API error
 
 
 # ---------------------------------------------------------------------------
@@ -153,11 +154,15 @@ class RoundController:
 
             steps = []
             working_dir = None
+            max_rounds = 0
+            api_err_retries = 3
             if conversation_id:
                 steps = await self.db.get_pipeline_steps(conversation_id)
                 conv  = await self.db.get_conversation(conversation_id)
                 if conv:
                     working_dir = conv.get('working_dir')
+                    max_rounds = conv.get('max_rounds') or 0
+                    api_err_retries = conv.get('api_err_retries') if conv.get('api_err_retries') is not None else 3
 
             if not steps:
                 steps = [
@@ -171,6 +176,8 @@ class RoundController:
                 conversation_id = conversation_id,
                 pipeline_steps  = steps,
                 working_dir     = working_dir,
+                max_rounds      = max_rounds,
+                api_err_retries = api_err_retries,
             )
 
             self.state = RoundState.RUNNING
@@ -220,7 +227,7 @@ class RoundController:
                 next_step = self.current_round.step_index + 1
                 if next_step > len(self.current_round.pipeline_steps):
                     # All steps done — start next round
-                    max_rounds = MAX_ROUNDS
+                    max_rounds = self.current_round.max_rounds
                     if max_rounds > 0 and self.current_round.round_index >= max_rounds:
                         await self.broadcast({
                             'type': 'system',
@@ -347,19 +354,35 @@ class RoundController:
                     break
 
                 if api_error:
-                    await self.broadcast({'type': 'system', 'content': 'API 错误，等待 60 秒后继续会话...'})
-                    await asyncio.sleep(60)
-                    if self._stop_requested:
-                        break
-                    await self._run_step(step)
+                    retries_left = self.current_round.api_err_retries
+                    retry_count = 0
+                    while api_error and retry_count < retries_left:
+                        retry_count += 1
+                        await self.broadcast({
+                            'type': 'system',
+                            'content': f'API 错误，60 秒后重试 ({retry_count}/{retries_left})...',
+                        })
+                        await asyncio.sleep(60)
+                        if self._stop_requested:
+                            break
+                        self.current_round.user_inputs = ['继续']
+                        api_error = await self._run_step(step)
+                        if self._stop_requested or self._stop_after_current:
+                            break
                     if self._stop_requested or self._stop_after_current:
+                        break
+                    if api_error:
+                        await self.broadcast({
+                            'type': 'system',
+                            'content': f'API 错误重试已达上限 ({retries_left} 次)，停止流程',
+                        })
                         break
 
                 # Advance to next step
                 next_step = self.current_round.step_index + 1
                 if next_step > len(self.current_round.pipeline_steps):
                     # All steps done — check max_rounds, then start next round
-                    max_rounds = MAX_ROUNDS
+                    max_rounds = self.current_round.max_rounds
                     if max_rounds > 0 and self.current_round.round_index >= max_rounds:
                         await self.broadcast({
                             'type': 'system',
@@ -395,8 +418,10 @@ class RoundController:
         conv_id       = self.current_round.conversation_id
         round_index   = self.current_round.round_index
         step_index    = self.current_round.step_index
-        is_resuming   = self.current_round.session_pk is not None
         resume_id     = self.current_round.resume_id
+
+        # Resume if we have resume_id (API error retry) or explicit session_pk (resume_session)
+        is_resuming   = resume_id is not None or self.current_round.session_pk is not None
 
         if not is_resuming:
             # Create a fresh session row
@@ -593,6 +618,7 @@ class RoundController:
         })
 
         # Clear session_pk so the next step creates a fresh row
+        # (unless we're about to resume due to API error — in that case, keep resume_id)
         self.current_round.session_pk = None
 
         return api_error
@@ -623,33 +649,50 @@ class RoundController:
         custom_template = step.get('prompt_template')
         conv_id         = self.current_round.conversation_id
 
-        # When resuming, the agent already has session memory — skip history injection
+        # When resuming, the agent already has session memory — just return user input
         if self.current_round.resume_id:
-            rows = []
-        elif conv_id:
-            # Use recent summaries (3 sessions) instead of full 40-message history
-            rows = await self.db.get_recent_summaries(conv_id, limit=3)
+            user_input = '继续'
+            if self.current_round.user_inputs:
+                user_input = '\n'.join(f'- {u}' for u in self.current_round.user_inputs)
+                self.current_round.user_inputs = []
+            return user_input
+
+        template = custom_template or DEFAULT_PROMPT_TEMPLATE
+
+        # Parse {user_input=N} and {chat_history=M} from template
+        user_input_match = re.search(r'\{user_input(?:=(\d+))?\}', template)
+        chat_history_match = re.search(r'\{chat_history(?:=(\d+))?\}', template)
+
+        user_input_limit = int(user_input_match.group(1)) if user_input_match and user_input_match.group(1) else 1
+        chat_history_limit = int(chat_history_match.group(1)) if chat_history_match and chat_history_match.group(1) else 3
+
+        # Fetch chat history
+        if conv_id:
+            rows = await self.db.get_recent_summaries(conv_id, limit=chat_history_limit)
         else:
             rows = []
 
         chat_history = self._format_history(rows)
 
+        # Build user_input
         user_input = '无'
         if self.current_round.user_inputs:
             user_input = '\n'.join(f'- {u}' for u in self.current_round.user_inputs)
             self.current_round.user_inputs = []
         elif conv_id:
-            latest = await self.db.get_latest_user_message(conv_id)
-            if latest:
-                user_input = f'- {latest}'
+            user_messages = await self.db.get_latest_user_message(conv_id, limit=user_input_limit)
+            if user_messages:
+                user_input = '\n'.join(f'- {m}' for m in user_messages)
 
         # last_summary: last non-NULL chat in history
         last_summary = (rows[-1].get('content') if rows else None) or '（上一步骤未提供总结）'
 
-        template = custom_template or DEFAULT_PROMPT_TEMPLATE
+        # Clean template placeholders (remove =N suffix)
+        clean_template = re.sub(r'\{user_input=\d+\}', '{user_input}', template)
+        clean_template = re.sub(r'\{chat_history=\d+\}', '{chat_history}', clean_template)
 
         try:
-            return template.format(
+            return clean_template.format(
                 round_number  = self.current_round.round_index,
                 chat_history  = chat_history,
                 user_input    = user_input,
@@ -658,7 +701,7 @@ class RoundController:
             )
         except KeyError as e:
             log.warning(f"Prompt template unknown variable {e}")
-            return template.format_map({
+            return clean_template.format_map({
                 'round_number':  self.current_round.round_index,
                 'chat_history':  chat_history,
                 'user_input':    user_input,
@@ -702,8 +745,10 @@ class RoundController:
             {'agent_type': 'codex',  'prompt_template': None},
             {'agent_type': 'claude', 'prompt_template': None},
         ]
-        conv        = await self.db.get_conversation(conversation_id)
-        working_dir = conv.get('working_dir') if conv else None
+        conv            = await self.db.get_conversation(conversation_id)
+        working_dir     = conv.get('working_dir') if conv else None
+        max_rounds      = (conv.get('max_rounds') or 0) if conv else 0
+        api_err_retries = (conv.get('api_err_retries') if conv and conv.get('api_err_retries') is not None else 3)
 
         latest = await self.db.get_latest_session(conversation_id)
         if not latest:
@@ -720,6 +765,8 @@ class RoundController:
                 conversation_id = conversation_id,
                 pipeline_steps  = steps,
                 working_dir     = working_dir,
+                max_rounds      = max_rounds,
+                api_err_retries = api_err_retries,
             )
             return True
 
@@ -727,7 +774,6 @@ class RoundController:
         next_step = cur_step + 1
         if next_step > len(steps):
             # All steps of this round done — open next round
-            max_rounds = MAX_ROUNDS
             if max_rounds > 0 and cur_round >= max_rounds:
                 await self.broadcast({
                     'type': 'system',
@@ -745,5 +791,7 @@ class RoundController:
             conversation_id = conversation_id,
             pipeline_steps  = steps,
             working_dir     = working_dir,
+            max_rounds      = max_rounds,
+            api_err_retries = api_err_retries,
         )
         return True

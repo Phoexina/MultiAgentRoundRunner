@@ -796,6 +796,49 @@ body {
   flex-shrink: 0;
 }
 
+/* Session config block (max rounds + retries) */
+.pipeline-conv-config {
+  padding: 10px 14px;
+  border-bottom: 1px solid #ddd;
+  background: #fafafa;
+  flex-shrink: 0;
+}
+
+.conv-config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.conv-config-row:last-child { margin-bottom: 0; }
+
+.conv-config-row label {
+  font-size: 11px;
+  color: #555;
+  white-space: nowrap;
+  min-width: 80px;
+}
+
+.conv-config-row input[type="number"] {
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 12px;
+  background: #fff;
+}
+
+.conv-config-row input[type="number"]:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.conv-config-hint {
+  font-size: 11px;
+  color: #999;
+}
+
+
 .pipeline-workdir label {
   display: block;
   font-size: 11px;

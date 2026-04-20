@@ -310,7 +310,9 @@ class ChatServer:
             await self._handle_save_pipeline(
                 data.get('conversation_id'),
                 data.get('steps', []),
-                data.get('working_dir')
+                data.get('working_dir'),
+                data.get('max_rounds'),
+                data.get('api_err_retries'),
             )
 
         elif msg_type == 'delete_session':
@@ -473,8 +475,10 @@ class ChatServer:
         payload = {
             'type': 'conversation_selected',
             'id': conv_id,
-            'name':        conv.get('name')        if conv else None,
-            'working_dir': conv.get('working_dir') if conv else None,
+            'name':            conv.get('name')            if conv else None,
+            'working_dir':     conv.get('working_dir')     if conv else None,
+            'max_rounds':      conv.get('max_rounds')      if conv else 0,
+            'api_err_retries': conv.get('api_err_retries') if conv else 3,
             'history':     history,
             'pipeline':    steps,
             'sessions':    sessions,
@@ -488,16 +492,18 @@ class ChatServer:
 
         await websocket.send(json.dumps(payload, ensure_ascii=False))
 
-    async def _handle_save_pipeline(self, conv_id, steps: list, working_dir: Optional[str] = None) -> None:
+    async def _handle_save_pipeline(self, conv_id, steps: list, working_dir: Optional[str] = None, max_rounds: Optional[int] = None, api_err_retries: Optional[int] = None) -> None:
         """Save pipeline steps and working_dir for a conversation"""
         if not conv_id:
             return
-        await self.db.save_pipeline_steps(int(conv_id), steps, working_dir=working_dir)
+        await self.db.save_pipeline_steps(int(conv_id), steps, working_dir=working_dir, max_rounds=max_rounds, api_err_retries=api_err_retries)
         await self.broadcast({
             'type': 'pipeline_updated',
             'conversation_id': conv_id,
             'steps': steps,
-            'working_dir': working_dir
+            'working_dir': working_dir,
+            'max_rounds': max_rounds,
+            'api_err_retries': api_err_retries,
         })
 
     async def _handle_delete_session(self, session_id) -> None:
