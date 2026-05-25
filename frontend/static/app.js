@@ -124,6 +124,7 @@ class ConversationSidebar {
         this.activeSessionId = null;
         this.currentPage = 0;
         this.totalPages = 1;
+        this.optimisticSessionIds = new Set();
 
         // Live process status for running sessions: { session_id -> { pid, duration, idle } }
         this.sessionStatus = new Map();
@@ -194,6 +195,7 @@ class ConversationSidebar {
         this.activeConvId = convId;
         this.activeSessionId = null;
         this.sessions = [];
+        this.optimisticSessionIds.clear();
         this.currentPage = 0;
         this.totalPages = 1;
         this.$pagination.style.display = 'none';
@@ -203,7 +205,13 @@ class ConversationSidebar {
     }
 
     setSessions(sessions, page, totalPages) {
-        this.sessions = sessions || [];
+        const incoming = sessions || [];
+        const incomingIds = new Set(incoming.map(s => s.id));
+        this.optimisticSessionIds = new Set(
+            [...this.optimisticSessionIds].filter(id => !incomingIds.has(id))
+        );
+        const pending = this.sessions.filter(s => this.optimisticSessionIds.has(s.id) && !incomingIds.has(s.id));
+        this.sessions = [...pending, ...incoming];
         if (page !== undefined) this.currentPage = page;
         if (totalPages !== undefined) this.totalPages = totalPages;
         this._renderSessions();
@@ -218,6 +226,7 @@ class ConversationSidebar {
             return;
         }
         if (this.sessions.find(s => s.id === session.id)) return;
+        this.optimisticSessionIds.add(session.id);
         this.sessions.unshift(session);
         this._renderSessions();
         this._renderPagination();
@@ -304,7 +313,7 @@ class ConversationSidebar {
             el.className = 'session-sidebar-item' + (s.id == this.activeSessionId ? ' active' : '');
             el.dataset.id = s.id;
             const agentType = s.agent_type || s.agent || 'claude';
-            const badgeClass = agentType === 'codex' ? 'badge-codex' : 'badge-claude';
+            const badgeClass = agentType === 'codex' ? 'badge-codex' : agentType === 'gemini' ? 'badge-gemini' : agentType === 'user' ? 'badge-user-input' : 'badge-claude';
 
             // Build label: "Round N-M" (step_index is 1-based)
             const roundIdx = s.round_index || s.round_number || 0;
@@ -462,9 +471,9 @@ class PipelinePanel {
         this.steps = steps.length ? steps.map(s => ({
             agent_type: s.agent_type,
             is_async: !!s.is_async,
-            prompt_template: (s.prompt_template && s.prompt_template.trim())
-                ? s.prompt_template
-                : this.defaultTemplate,
+            prompt_template: (s.agent_type === 'user' || s.agent_type === 'user_input')
+                ? (s.prompt_template || '')
+                : ((s.prompt_template && s.prompt_template.trim()) ? s.prompt_template : this.defaultTemplate),
         })) : [
             { agent_type: 'codex',  is_async: false, prompt_template: this.defaultTemplate },
             { agent_type: 'claude', is_async: false, prompt_template: this.defaultTemplate },
@@ -484,7 +493,8 @@ class PipelinePanel {
 
     _addStep() {
         const lastAgent = this.steps.length > 0 ? this.steps[this.steps.length - 1].agent_type : 'claude';
-        const newAgent = lastAgent === 'codex' ? 'claude' : 'codex';
+        const cycleNext = { codex: 'claude', claude: 'gemini', gemini: 'codex' };
+        const newAgent = cycleNext[lastAgent] || 'codex';
         this.steps.push({ agent_type: newAgent, is_async: false, prompt_template: this.defaultTemplate });
         this._render();
     }
@@ -507,13 +517,15 @@ class PipelinePanel {
             el.innerHTML = `
                 <span class="step-num">${i + 1}</span>
                 <select class="step-agent-select">
-                    <option value="codex"  ${step.agent_type === 'codex'  ? 'selected' : ''}>Codex</option>
-                    <option value="claude" ${step.agent_type === 'claude' ? 'selected' : ''}>Claude</option>
+                    <option value="codex"      ${step.agent_type === 'codex'       ? 'selected' : ''}>Codex</option>
+                    <option value="claude"     ${step.agent_type === 'claude'      ? 'selected' : ''}>Claude</option>
+                    <option value="gemini"     ${step.agent_type === 'gemini'      ? 'selected' : ''}>Gemini</option>
+                    <option value="user" ${step.agent_type === 'user'  ? 'selected' : ''}>用户输入</option>
                 </select>
                 <label class="step-async-label" title="与前后相邻的异步步骤并行执行">
                     <input type="checkbox" class="step-async-cb" ${step.is_async ? 'checked' : ''}>异步
                 </label>
-                <button class="step-prompt-btn ${hasCustom ? 'has-custom' : ''}" title="${hasCustom ? '已自定义提示词' : '使用默认模板'}">提示词</button>
+                ${step.agent_type !== 'user' ? `<button class="step-prompt-btn ${hasCustom ? 'has-custom' : ''}" title="${hasCustom ? '已自定义提示词' : '使用默认模板'}">提示词</button>` : ''}
                 <button class="step-del-btn" title="删除步骤">×</button>
             `;
             el.querySelector('.step-agent-select').addEventListener('change', (e) => {
@@ -522,7 +534,7 @@ class PipelinePanel {
             el.querySelector('.step-async-cb').addEventListener('change', (e) => {
                 this.steps[i].is_async = e.target.checked;
             });
-            el.querySelector('.step-prompt-btn').addEventListener('click', () => {
+            el.querySelector('.step-prompt-btn')?.addEventListener('click', () => {
                 this._openPromptModal(i);
             });
             el.querySelector('.step-del-btn').addEventListener('click', () => this._removeStep(i));
@@ -544,7 +556,7 @@ class PipelinePanel {
             <div class="conv-modal-backdrop"></div>
             <div class="conv-modal-content prompt-edit-modal-content">
                 <div class="conv-modal-header">
-                    <span>步骤 ${idx + 1} · ${step.agent_type} · 提示词模板</span>
+                    <span>步骤 ${idx + 1} · ${{ codex: 'Codex', claude: 'Claude', gemini: 'Gemini', user: '用户输入' }[step.agent_type] || step.agent_type} · 提示词模板</span>
                     <button class="prompt-modal-close">×</button>
                 </div>
                 <div class="prompt-edit-body">
@@ -583,7 +595,7 @@ class PipelinePanel {
         const steps = this.steps.map(s => ({
             agent_type: s.agent_type,
             is_async: s.is_async || false,
-            prompt_template: s.prompt_template || null,
+            prompt_template: (s.agent_type === 'user' || s.agent_type === 'user_input') ? null : (s.prompt_template || null),
         }));
         this.ws.send({
             type: 'save_pipeline',
@@ -662,6 +674,12 @@ function parseLogEntry(log) {
                 return { kind: 'text', text: delta.text };
             }
             return null;
+        }
+
+        // Gemini: plain text chunk {"type":"text","content":"..."}
+        if (t === 'text') {
+            const text = typeof ev.content === 'string' ? ev.content : '';
+            return text ? { kind: 'text', text } : null;
         }
 
         // Claude: tool_result
@@ -795,6 +813,19 @@ function renderLogEntries(logs) {
     return items;
 }
 
+// Decode chat column content that may be a legacy JSON-wrapped event string
+// e.g. '{"type":"text","content":"actual text"}' → 'actual text'
+function decodeChatContent(raw) {
+    if (!raw) return raw;
+    try {
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj === 'object' && obj.type === 'text' && typeof obj.content === 'string') {
+            return obj.content;
+        }
+    } catch (_) {}
+    return raw;
+}
+
 // ============================================================
 // Structured message renderer (used by _openSessionView with /messages endpoint)
 // ============================================================
@@ -857,6 +888,7 @@ class ChatUI {
         this.ws = ws;
         this.currentConvId = null;
         this.inSessionView = false;
+        this._filePollingTimer = null;
 
         this.$main = document.getElementById('chat-main');
         this.$title = document.getElementById('chat-title');
@@ -865,6 +897,8 @@ class ChatUI {
         this.$sessionViewHeader = document.getElementById('session-view-header');
         this.$sessionViewTitle = document.getElementById('session-view-title');
         this.$backBtn = document.getElementById('back-btn');
+        this.$waitingBanner = document.getElementById('waiting-banner');
+        this.$waitingMessage = document.getElementById('waiting-message');
         this.$interventionBanner = document.getElementById('intervention-banner');
         this.$countdown = document.getElementById('countdown');
         this.$interventionMessage = document.getElementById('intervention-message');
@@ -935,19 +969,19 @@ class ChatUI {
         const div = document.createElement('div');
         div.className = `message message-${role}`;
 
-        const roleMap = { user: '用户', codex: 'Codex', claude: 'Claude', system: '系统' };
+        const roleMap = { user: '用户', user_input: '用户指示', codex: 'Codex', claude: 'Claude', gemini: 'Gemini', system: '系统' };
         const roleLabel = roleMap[role] || role;
 
-        // Build "Round X-Y" suffix for agent messages
+        // Round label for all formal pipeline steps (agents + pipeline user steps)
         let roundLabel = '';
-        if (role !== 'user' && role !== 'system' && roundIndex) {
+        if (role !== 'user_input' && role !== 'system' && roundIndex) {
             roundLabel = stepIndex
                 ? ` · Round ${roundIndex}-${stepIndex}`
                 : ` · Round ${roundIndex}`;
         }
 
         // Handle null/undefined content (session in progress)
-        const displayContent = content ? escapeHtml(content) : '<span style="color:#888;">运行中...</span>';
+        const displayContent = content ? escapeHtml(decodeChatContent(content)) : '<span style="color:#888;">运行中...</span>';
 
         div.innerHTML = `
             <div class="message-header">
@@ -957,7 +991,8 @@ class ChatUI {
             <div class="message-content">${displayContent}</div>
         `;
 
-        if (sessionId && role !== 'user' && role !== 'system') {
+        if (sessionId && role !== 'user' && role !== 'user_input' && role !== 'system') {
+            div.dataset.sessionId = sessionId;
             const btn = document.createElement('button');
             btn.className = 'view-log-link';
             btn.textContent = '查看运行日志';
@@ -1005,7 +1040,7 @@ class ChatUI {
                 for (const el of items) this.$sessionView.appendChild(el);
             } else if (data.source === 'db_only') {
                 // session_id not yet assigned (agent just started) — show chat summary if available
-                const chat = data.session && data.session.chat;
+                const chat = decodeChatContent(data.session && data.session.chat);
                 if (chat) {
                     const el = document.createElement('div');
                     el.className = 'text-bubble assistant';
@@ -1016,7 +1051,7 @@ class ChatUI {
                 }
             } else if (data.source === 'not_found') {
                 // JSONL file not found — show chat summary from DB if available
-                const chat = data.session && data.session.chat;
+                const chat = decodeChatContent(data.session && data.session.chat);
                 if (chat) {
                     const el = document.createElement('div');
                     el.className = 'text-bubble assistant';
@@ -1029,7 +1064,13 @@ class ChatUI {
                 this.$sessionView.innerHTML = '<div style="color:#888;padding:16px;">暂无内容</div>';
             }
 
-            this._scrollSessionViewToBottom();
+            const liveStatus = this.sidebar?.sessionStatus.get(this._currentSessionData?.id || sessionId);
+            if (this._currentSessionData?.agent_type === 'gemini' && liveStatus) {
+                this._startFilePolling(sessionId);
+            } else {
+                this._stopFilePolling();
+            }
+            this.$sessionView.scrollTop = 0;
         } catch (e) {
             this.$sessionView.innerHTML = `<div style="color:#f38ba8;padding:16px;">加载失败: ${escapeHtml(String(e))}</div>`;
         }
@@ -1044,7 +1085,7 @@ class ChatUI {
         }
 
         const agentType = s.agent_type || s.agent || 'agent';
-        const badgeClass = agentType === 'codex' ? 'badge-codex' : 'badge-claude';
+        const badgeClass = agentType === 'codex' ? 'badge-codex' : agentType === 'gemini' ? 'badge-gemini' : agentType === 'user' ? 'badge-user-input' : 'badge-claude';
         const roundIdx = s.round_index || s.round_number || 0;
         const stepIdx  = s.step_index || 0;
         const stepPart = (roundIdx > 0 && stepIdx > 0) ? `-${stepIdx}` : '';
@@ -1064,6 +1105,9 @@ class ChatUI {
             ? `<button type="button" class="session-header-btn resume" title="继续此会话">继续</button>`
             : '';
 
+        // Refresh button
+        const refreshBtn = `<button type="button" class="session-header-btn refresh" title="重新提取 summary 并更新">刷新</button>`;
+
         // Delete button
         const deleteBtn = `<button type="button" class="session-header-btn delete" title="删除此记录">删除</button>`;
 
@@ -1073,6 +1117,7 @@ class ChatUI {
             ${statusHtml}
             <span class="session-header-actions">
                 ${resumeBtn}
+                ${refreshBtn}
                 ${deleteBtn}
             </span>
         `;
@@ -1083,6 +1128,14 @@ class ChatUI {
             resumeBtnEl.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.sidebar._showResumeModal(s);
+            });
+        }
+
+        const refreshBtnEl = this.$sessionViewTitle.querySelector('.session-header-btn.refresh');
+        if (refreshBtnEl) {
+            refreshBtnEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.ws.send({ type: 'refresh_session', id: s.id });
             });
         }
 
@@ -1099,6 +1152,11 @@ class ChatUI {
     }
 
     appendSessionLog(logMsg) {
+        // Gemini: text/tool content comes from file polling — skip here to avoid duplication
+        if (this._currentSessionData?.agent_type === 'gemini') {
+            const entry = parseLogEntry(logMsg);
+            if (entry && (entry.kind === 'text' || entry.kind === 'tool_use' || entry.kind === 'tool_result')) return;
+        }
         // Remove "no content" placeholder if present
         const placeholder = this.$sessionView.querySelector('div[style]');
         if (placeholder && placeholder.textContent.includes('暂无内容')) {
@@ -1121,16 +1179,20 @@ class ChatUI {
                 ? lastEl.querySelector('.bubble-body') : null;
 
             if (logMsg.event_type === 'stream_event') {
-                // Incremental delta — append to existing bubble if available
+                // Claude: incremental delta — append to existing bubble if available
                 if (lastBody) {
                     lastBody.appendChild(document.createTextNode(entry.text));
                     this._scrollSessionViewToBottom();
                     return;
                 }
             } else if (logMsg.event_type === 'assistant' && lastBody) {
-                // Final complete message — replace accumulated delta text so
-                // we don't double-print the same content
+                // Claude: final complete message — replace accumulated delta text
                 lastBody.textContent = entry.text;
+                this._scrollSessionViewToBottom();
+                return;
+            } else if (logMsg.event_type === 'text' && lastBody) {
+                // Gemini: streaming text chunk — append to existing bubble
+                lastBody.appendChild(document.createTextNode(entry.text));
                 this._scrollSessionViewToBottom();
                 return;
             }
@@ -1147,6 +1209,36 @@ class ChatUI {
         this.$sessionView.scrollTop = this.$sessionView.scrollHeight;
     }
 
+    _startFilePolling(sessionPk) {
+        this._stopFilePolling();
+        this._filePollingTimer = setInterval(() => this._pollSessionFile(sessionPk), 2000);
+    }
+
+    async _pollSessionFile(sessionPk) {
+        if (this.viewingSessionId !== sessionPk) { this._stopFilePolling(); return; }
+        try {
+            const resp = await fetch(`/api/sessions/${sessionPk}/messages`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (data.source !== 'file' || !data.messages?.length) return;
+            this.$sessionView.innerHTML = '';
+            if (data.path) {
+                const badge = document.createElement('div');
+                badge.style.cssText = 'font-size:11px;color:#585b70;padding:4px 12px 8px;font-family:monospace;';
+                badge.textContent = data.path;
+                this.$sessionView.appendChild(badge);
+            }
+            for (const el of renderStructuredMessages(data.messages)) {
+                this.$sessionView.appendChild(el);
+            }
+            this._scrollSessionViewToBottom();
+        } catch (_) {}
+    }
+
+    _stopFilePolling() {
+        if (this._filePollingTimer) { clearInterval(this._filePollingTimer); this._filePollingTimer = null; }
+    }
+
     openSessionFromSidebar(session) {
         this._openSessionView(session.id, '', session);
     }
@@ -1160,6 +1252,7 @@ class ChatUI {
     showChatView() {
         this.inSessionView = false;
         this.viewingSessionId = null;
+        this._stopFilePolling();
         this.$main.classList.remove('session-view');
         this.$sessionViewHeader.classList.add('hidden');
     }
@@ -1175,6 +1268,16 @@ class ChatUI {
         this.$interventionBanner.classList.add('hidden');
         this._stopCountdown();
     }
+
+    showWaitingBanner(message) {
+        this.$waitingMessage.textContent = message || '当前步骤需要用户输入，发送消息后继续。';
+        this.$waitingBanner.classList.remove('hidden');
+    }
+
+    hideWaitingBanner() {
+        this.$waitingBanner.classList.add('hidden');
+    }
+
 
     _startCountdown(seconds) {
         this._stopCountdown();
@@ -1203,6 +1306,7 @@ class ChatUI {
             idle: '空闲',
             agent_starting: '启动中',
             agent_running: '运行中',
+            running: '运行中',
             intervention: '等待介入',
             stopping: '停止中',
             error: '出错',
@@ -1218,8 +1322,7 @@ class ChatUI {
                 // Not started yet
                 roundText = 'Round 0';
             } else if (stepIndex !== undefined && stepIndex !== null) {
-                // Running: step_index is 0-based internally, display as 1-based
-                const stepDisplay = stepIndex + 1;
+                const stepDisplay = stepIndex;
                 roundText = `Round ${roundNum}-${stepDisplay}`;
                 if (agent) {
                     roundText += ` (${agent})`;
@@ -1396,7 +1499,12 @@ class App {
                 // Load sessions for this conversation only
                 const sessions = msg.sessions || [];
                 this.sidebar.setSessions(sessions, msg.page || 0, msg.total_pages || 1);
-                this.chatUI.setHasHistory(sessions.length > 0 || (msg.page || 0) > 0);
+                this.chatUI.setHasHistory(
+                    sessions.length > 0 ||
+                    (msg.history || []).length > 0 ||
+                    (msg.round_number || 0) > 0 ||
+                    (msg.page || 0) > 0
+                );
                 // Update round/step display with current progress
                 this.chatUI.setStatus('idle', msg.round_number, msg.step_index, msg.total_steps, null);
                 // Update URL
@@ -1405,6 +1513,18 @@ class App {
             }
 
             case 'pipeline_updated':
+                if (msg.conversation_id == this.sidebar.activeConvId) {
+                    const conv = this.sidebar.conversations.find(c => c.id == msg.conversation_id);
+                    const convName = conv ? conv.name : String(msg.conversation_id);
+                    this.pipeline.load(
+                        msg.conversation_id,
+                        convName,
+                        msg.steps || [],
+                        msg.working_dir,
+                        msg.max_rounds,
+                        msg.api_err_retries
+                    );
+                }
                 break;
 
             case 'history':
@@ -1413,12 +1533,22 @@ class App {
 
             case 'state':
                 this.chatUI.setStatus(msg.state, msg.round_number, msg.step_index, msg.total_steps, msg.agent);
+                if (msg.waiting_for_input) {
+                    this.chatUI.showWaitingBanner(msg.message);
+                } else {
+                    this.chatUI.hideWaitingBanner();
+                }
                 break;
 
             case 'agent_status':
                 this.chatUI.setStatus(msg.state, msg.round, msg.step_index, msg.total_steps, msg.agent);
                 if (msg.state !== 'intervention') {
                     this.chatUI.hideInterventionBanner();
+                }
+                if (msg.waiting_for_input) {
+                    this.chatUI.showWaitingBanner(`Round ${msg.round}-${msg.step_index} 等待用户输入`);
+                } else {
+                    this.chatUI.hideWaitingBanner();
                 }
                 // When transitioning to idle/stopping/error, clear all live statuses
                 if (['idle', 'stopping', 'error'].includes(msg.state)) {
@@ -1434,6 +1564,9 @@ class App {
             case 'chat_message':
                 if (!msg.conversation_id || msg.conversation_id == this.sidebar.activeConvId) {
                     this.chatUI.appendMessage(msg.role, msg.content, msg.session_id, msg.timestamp, msg.round_index, msg.step_index);
+                    if (msg.role === 'user') {
+                        this.chatUI.hideWaitingBanner();
+                    }
                 }
                 // Refresh session sidebar for this conversation when a session summary arrives
                 if (msg.session_id && this.sidebar.activeConvId) {
@@ -1442,13 +1575,35 @@ class App {
                 }
                 break;
 
+            case 'session_refreshed': {
+                // Update the chat bubble content in place
+                const bubble = this.chatUI.$messages.querySelector(`[data-session-id="${msg.session_id}"]`);
+                if (bubble) {
+                    const contentEl = bubble.querySelector('.message-content');
+                    if (contentEl) {
+                        contentEl.innerHTML = msg.chat
+                            ? escapeHtml(decodeChatContent(msg.chat))
+                            : '<span style="color:#888;">运行中...</span>';
+                    }
+                }
+                // If the session view is open for this session, reload it
+                if (this.chatUI.viewingSessionId == msg.session_id) {
+                    this.chatUI._openSessionView(msg.session_id);
+                }
+                break;
+            }
+
             case 'system':
                 this.chatUI.appendMessage('system', msg.content, null, new Date().toISOString());
                 break;
 
             case 'sessions_list':
                 this.sidebar.setSessions(msg.sessions || [], msg.page, msg.total_pages);
-                this.chatUI.setHasHistory((msg.sessions || []).length > 0 || (msg.page || 0) > 0);
+                this.chatUI.setHasHistory(
+                    (msg.sessions || []).length > 0 ||
+                    (msg.history || []).length > 0 ||
+                    (msg.page || 0) > 0
+                );
                 if (msg.history) {
                     this.chatUI.loadHistory(msg.history);
                 }
@@ -1486,8 +1641,17 @@ class App {
                 break;
 
             case 'session_log':
-                // Real-time log entry — append if currently viewing that session
                 if (this.chatUI.viewingSessionId === msg.session_id) {
+                    // Gemini: start file polling when session_id arrives
+                    if (msg.event_type === 'session_init' &&
+                        this.chatUI._currentSessionData?.agent_type === 'gemini') {
+                        this.chatUI._startFilePolling(msg.session_id);
+                    }
+                    // Stop polling on done and do one final refresh
+                    if (msg.event_type === 'done') {
+                        this.chatUI._stopFilePolling();
+                        this.chatUI._pollSessionFile(msg.session_id);
+                    }
                     this.chatUI.appendSessionLog(msg);
                 }
                 break;
@@ -1500,6 +1664,16 @@ class App {
 
             case 'intervention_window':
                 this.chatUI.showInterventionBanner(msg.message, msg.timeout_seconds);
+                break;
+
+            case 'waiting_for_input':
+                if (msg.active) {
+                    if (!msg.conversation_id || !this.sidebar.activeConvId || msg.conversation_id == this.sidebar.activeConvId) {
+                        this.chatUI.showWaitingBanner(msg.message);
+                    }
+                } else {
+                    this.chatUI.hideWaitingBanner();
+                }
                 break;
 
             case 'agent_output':

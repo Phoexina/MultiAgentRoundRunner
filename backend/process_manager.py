@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .cli_types import ProcessResult, is_cli_error, is_cli_timeout, is_parse_error
-from .stream_parser import parse_ndjson, read_lines
+from .stream_parser import parse_ndjson, parse_plaintext, read_lines
 
 import logging
 log = logging.getLogger(__name__)
@@ -23,6 +23,14 @@ log = logging.getLogger(__name__)
 AGENT_COMMANDS: dict[str, str] = {
     'codex':  'codex',
     'claude': 'claude',
+    'gemini': 'gemini',
+}
+
+# Agents that output plain text on stdout (not NDJSON)
+AGENT_STDOUT_FORMAT: dict[str, str] = {
+    'claude': 'ndjson',
+    'codex':  'ndjson',
+    'gemini': 'text',
 }
 
 
@@ -75,6 +83,7 @@ class AgentProcess:
         self._killed = False
         self._pending_logs: list[AgentOutput] = []
         self._status: Optional[ProcessStatus] = None
+        self._pending_stdin: Optional[str] = None
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.returncode is None
@@ -100,17 +109,29 @@ class AgentProcess:
             cmd.extend(['--resume', session_id])
         return cmd, prompt
 
+    def _build_gemini_command(self, prompt: str, session_id: Optional[str] = None) -> tuple[list[str], str]:
+        """Build Gemini CLI command.  Prompt is passed via stdin."""
+        cmd = [self.command, '--yolo']
+        if session_id:
+            cmd.extend(['--resume', session_id])
+        return cmd, prompt
+
     def _build_codex_command(self, prompt: str, session_id: Optional[str] = None) -> tuple[list[str], str]:
         """
         Build Codex CLI command.
-        Prompt is passed via stdin (using '-') to avoid shell escaping issues with multi-line prompts.
-        Codex reads .codex/config.toml from cwd automatically.
+        Always pass prompt via stdin ('-') so multiline content survives shell parsing.
         """
-        cmd = [self.command, 'exec']
         if session_id:
-            cmd.extend(['resume', session_id])
-        cmd.extend(['--skip-git-repo-check', '-s', 'danger-full-access', '--json', '--config', 'approval_policy="on-request"', '--', '-'])
-        return cmd, prompt
+            cmd = [self.command, 'exec', '-s', 'danger-full-access', 'resume',
+                   '--skip-git-repo-check', '--json',
+                   session_id, '-']
+            return cmd, prompt
+        else:
+            cmd = [self.command, 'exec',
+                   '--skip-git-repo-check', '-s', 'danger-full-access',
+                   '--json', '--config', 'approval_policy="on-request"',
+                   '--', '-']
+            return cmd, prompt
 
     def _escape_shell_args(self, args: list[str]) -> list[str]:
         """Escape shell arguments for Windows cmd"""
@@ -122,8 +143,14 @@ class AgentProcess:
                 escaped.append(arg)
         return escaped
 
-    async def start(self, prompt: str, session_id: Optional[str] = None) -> None:
-        """Start the agent subprocess."""
+    async def start(self, prompt: str, session_id: Optional[str] = None,
+                    delay_stdin: bool = False) -> None:
+        """Start the agent subprocess.
+
+        When delay_stdin=True the stdin pipe is opened but the prompt is NOT
+        written yet — call send_stdin() later to flush it.  Used by Gemini so
+        we can read the JSONL sessionId before the model starts processing.
+        """
         if shutil.which(self.command) is None:
             log.warning(f"{self.agent_name} CLI not found, using mock mode")
             await self._run_mock(prompt)
@@ -133,18 +160,18 @@ class AgentProcess:
             cmd, stdin_content = self._build_claude_command(prompt, session_id)
         elif self.agent_name == 'codex':
             cmd, stdin_content = self._build_codex_command(prompt, session_id)
+        elif self.agent_name == 'gemini':
+            cmd, stdin_content = self._build_gemini_command(prompt, session_id)
         else:
             raise ValueError(f"Unknown agent: {self.agent_name}")
 
         cwd = self.working_dir
         log.info(f"Starting {self.agent_name} in {cwd}: {' '.join(cmd[:6])}...")
 
-        needs_stdin = bool(stdin_content)
+        needs_stdin = bool(stdin_content) or delay_stdin
 
         if sys.platform == 'win32':
             shell_cmd = ' '.join(self._escape_shell_args(cmd))
-            # Inherit parent environment so PATH, API keys etc. are available,
-            # then override encoding vars to force UTF-8 from Python subprocesses.
             env = os.environ.copy()
             env['PYTHONIOENCODING'] = 'utf-8'
             env['PYTHONUTF8'] = '1'
@@ -165,8 +192,9 @@ class AgentProcess:
                 cwd=cwd,
             )
 
-        if needs_stdin and self.process.stdin:
-            # stdin expects bytes; stdout/stderr will be decoded in ndjson_parser
+        if delay_stdin:
+            self._pending_stdin = stdin_content
+        elif needs_stdin and self.process.stdin:
             self.process.stdin.write((stdin_content + '\n').encode('utf-8'))
             await self.process.stdin.drain()
             self.process.stdin.close()
@@ -179,6 +207,14 @@ class AgentProcess:
             start_time=time.time(),
             last_output_time=time.time(),
         )
+
+    async def send_stdin(self) -> None:
+        """Flush the delayed stdin prompt and close the pipe."""
+        if self.process and self.process.stdin and self._pending_stdin is not None:
+            self.process.stdin.write((self._pending_stdin + '\n').encode('utf-8'))
+            await self.process.stdin.drain()
+            self.process.stdin.close()
+            self._pending_stdin = None
 
     async def _kill_process_tree(self) -> None:
         """Kill the process and all its children.
@@ -267,9 +303,14 @@ class AgentProcess:
         _DONE_STDOUT = object()
         _DONE_STDERR = object()
 
+        _parse_stdout = (
+            parse_ndjson if AGENT_STDOUT_FORMAT.get(self.agent_name, 'ndjson') == 'ndjson'
+            else parse_plaintext
+        )
+
         async def read_stdout():
             try:
-                async for event in parse_ndjson(self.process.stdout):
+                async for event in _parse_stdout(self.process.stdout):
                     await merged.put(('stdout', event))
             except Exception as e:
                 log.error(f"Error reading stdout: {e}")
@@ -387,6 +428,15 @@ class AgentProcess:
             if output.stream == 'event':
                 try:
                     event = json.loads(output.content)
+                    # Gemini: plain-text event {"type": "text", "content": "..."}
+                    if isinstance(event, dict) and event.get('type') == 'text':
+                        t = event.get('content') or ''
+                        if t:
+                            collected_texts.append(t)
+                            m = pattern.search(t)
+                            if m:
+                                return m.group(1).strip()
+                        continue
                     # Codex: item.completed / agent_message
                     item = event.get('item') if isinstance(event, dict) else None
                     if isinstance(item, dict):
@@ -419,14 +469,29 @@ class AgentProcess:
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-        # Fallback: return last non-trivial text chunk
+        # Gemini: no [SUMMARY] markers — return full joined output
+        if self.agent_name == 'gemini' and collected_texts:
+            combined = '\n'.join(t for t in collected_texts if t.strip())
+            return combined[:4000] + ('...' if len(combined) > 4000 else '')
+
+        # Fallback: return last non-trivial text chunk (Claude / Codex)
         for text in reversed(collected_texts):
             if len(text) > 10:
                 return text[:500] + ('...' if len(text) > 500 else '')
 
         for output in reversed(self._pending_logs):
             if output.stream in ('stdout', 'event') and output.content and len(output.content) > 10:
-                return output.content[:500] + ('...' if len(output.content) > 500 else '')
+                if output.stream == 'event':
+                    try:
+                        ev = json.loads(output.content)
+                        if isinstance(ev, dict) and ev.get('type') == 'text':
+                            t = ev.get('content') or ''
+                            if len(t) > 10:
+                                return t[:500] + ('...' if len(t) > 500 else '')
+                    except Exception:
+                        pass
+                else:
+                    return output.content[:500] + ('...' if len(output.content) > 500 else '')
 
         return f"{self.agent_name.capitalize()} completed this round"
 
@@ -464,17 +529,46 @@ class ProcessManager:
         process = AgentProcess(agent_name, command, working_dir=working_dir_override or '.')
         self._active_processes.append(process)
 
+        # Gemini: snapshot existing files, then start with delayed stdin so we
+        # can read the JSONL sessionId before the model processes the prompt.
+        _pre_gemini_paths: set = set()
+        if agent_name == 'gemini':
+            from . import session_reader as _sr
+            _pre_gemini_paths = _sr.snapshot_gemini_sessions()
+
         try:
             await process.start(
                 prompt=prompt,
                 session_id=session_id,
+                delay_stdin=(agent_name == 'gemini'),
             )
+
+            # Gemini: poll for the new JSONL header to get sessionId, then send prompt
+            if agent_name == 'gemini':
+                for _ in range(40):  # up to 20 s
+                    await asyncio.sleep(0.5)
+                    sid = _sr.find_latest_gemini_session_id(_pre_gemini_paths)
+                    if sid:
+                        process.session_id = sid
+                        yield AgentOutput(
+                            'event',
+                            json.dumps({'type': 'session_init', 'session_id': sid}),
+                            'session_init',
+                        )
+                        break
+                await process.send_stdin()
 
             async for output in process.stream_output():
                 process.add_log(output)
                 yield output
 
             result = await process.wait()
+
+            # Fallback: find session_id after exit if polling didn't catch it
+            if agent_name == 'gemini' and not result.session_id:
+                sid = _sr.find_latest_gemini_session_id(_pre_gemini_paths)
+                if sid:
+                    result = ProcessResult(result.exit_code, sid, result.summary, result.error)
 
             yield AgentOutput(
                 'event',

@@ -126,8 +126,25 @@ class ChatServer:
                     session = await self.db.get_session(session_id)
                     if session:
 
-                        # session_id (CLI UUID) not yet written — session just started
+                        # session_id (CLI UUID) not yet written — session just started,
+                        # or was never stored (pre-fix). For Gemini, try time-based lookup.
                         if not session.get('session_id'):
+                            if session.get('agent_type') == 'gemini':
+                                conv = await self.db.get_conversation(session['conv_id'])
+                                working_dir = conv.get('working_dir') if conv else None
+                                path = session_reader.find_gemini_session_by_time(
+                                    session['created_at'], working_dir
+                                )
+                                if path:
+                                    loader = (session_reader.load_gemini_jsonl_messages
+                                              if path.suffix == '.jsonl'
+                                              else session_reader.load_gemini_messages)
+                                    return self._json_response({
+                                        'session': session,
+                                        'source': 'file',
+                                        'messages': loader(path),
+                                        'path': str(path),
+                                    })
                             return self._json_response({
                                 'session': session,
                                 'source': 'db_only',
@@ -256,6 +273,7 @@ class ChatServer:
             'type': 'state',
             'state': state.value,
             'round_number': round_data.round_index,
+            'waiting_for_input': self.round_controller.is_waiting_for_input(),
         }
         # Add step progress info
         if round_data.pipeline_steps:
@@ -267,6 +285,15 @@ class ChatServer:
                 payload['agent'] = current_step.get('agent_type', 'agent')
 
         await websocket.send(json.dumps(payload, ensure_ascii=False))
+        if self.round_controller.is_waiting_for_input():
+            await websocket.send(json.dumps({
+                'type': 'waiting_for_input',
+                'active': True,
+                'conversation_id': round_data.conversation_id,
+                'round_index': round_data.round_index,
+                'step_index': round_data.step_index,
+                'message': f'Round {round_data.round_index}-{round_data.step_index} 等待用户输入',
+            }, ensure_ascii=False))
 
     async def _handle_message(self, websocket: WebSocketServerProtocol, raw_message: str) -> None:
         """Handle an incoming message"""
@@ -321,6 +348,9 @@ class ChatServer:
         elif msg_type == 'resume_session':
             await self._handle_resume_session(data.get('session_id'), data.get('user_input') or data.get('prompt'))
 
+        elif msg_type == 'refresh_session':
+            await self._handle_refresh_session(data.get('id'))
+
         else:
             log.warning(f"Unknown message type: {msg_type}")
 
@@ -338,23 +368,30 @@ class ChatServer:
         round_data = self.round_controller.get_current_round()
         conversation_id = data.get('conversation_id') or round_data.conversation_id
 
-        # Save user message to DB (agent_type='user')
+        # pipeline user step (waiting) → agent_type='user', role='user'
+        # free intervention → agent_type='user_input', role='user_input'
+        is_pipeline_step = self.round_controller.is_waiting_for_input()
+        msg_agent_type = 'user' if is_pipeline_step else 'user_input'
         if conversation_id:
             await self.db.add_user_message(
                 conversation_id,
                 round_data.round_index,
                 round_data.step_index,
                 content,
+                agent_type=msg_agent_type,
             )
 
-        # Broadcast to all clients
-        await self.broadcast({
+        broadcast_msg = {
             'type': 'chat_message',
-            'role': 'user',
+            'role': msg_agent_type,
             'content': content,
             'conversation_id': conversation_id,
-            'timestamp': datetime.now().isoformat()
-        })
+            'timestamp': datetime.now().isoformat(),
+        }
+        if is_pipeline_step:
+            broadcast_msg['round_index'] = round_data.round_index
+            broadcast_msg['step_index']  = round_data.step_index
+        await self.broadcast(broadcast_msg)
 
         # Forward to round controller (accepted any time while running)
         if self.round_controller.is_running():
@@ -458,7 +495,8 @@ class ChatServer:
 
         if sessions:
             ids = [s['id'] for s in sessions]
-            min_id = min(ids)
+            # page 0: include everything from start so user messages before first agent session appear
+            min_id = 0 if page == 0 else min(ids)
             max_id = 2 ** 31 if page == 0 else max(ids)
             history = await self.db.get_chat_history_range(conv_id, min_id, max_id)
         else:
@@ -539,6 +577,47 @@ class ChatServer:
                 'type': 'system',
                 'content': f'无法继续 Session {session_id}'
             })
+
+    async def _handle_refresh_session(self, session_id) -> None:
+        """Re-extract summary from JSONL file, update DB, broadcast update."""
+        if not session_id:
+            return
+        session_id = int(session_id)
+        session = await self.db.get_session(session_id)
+        if not session:
+            return
+
+        agent_type = session.get('agent_type', '')
+        cli_id = session.get('session_id')
+        extracted = None
+
+        if cli_id:
+            extracted = session_reader.extract_session_summary(agent_type, cli_id)
+        elif agent_type == 'gemini':
+            conv = await self.db.get_conversation(session['conv_id'])
+            working_dir = conv.get('working_dir') if conv else None
+            path = session_reader.find_gemini_session_by_time(session['created_at'], working_dir)
+            if path:
+                loader = (session_reader.load_gemini_jsonl_messages
+                          if path.suffix == '.jsonl'
+                          else session_reader.load_gemini_messages)
+                msgs = loader(path)
+                for msg in reversed(msgs):
+                    if msg.get('role') == 'assistant' and msg.get('type') == 'text':
+                        extracted = msg['content']
+                        break
+
+        if not extracted:
+            await self.broadcast({'type': 'system', 'content': f'Session {session_id} 无法从文件提取内容'})
+            return
+
+        await self.db.update_session_chat(session_id, extracted)
+        await self.broadcast({
+            'type': 'session_refreshed',
+            'session_id': session_id,
+            'chat': extracted,
+            'conversation_id': session['conv_id'],
+        })
 
     async def broadcast(self, message: dict) -> None:
         """Broadcast a message to all connected clients"""

@@ -229,13 +229,18 @@ class Database:
         round_index: int,
         step_index:  int,
         content:     str,
+        agent_type:  str = 'user',
     ) -> int:
-        """Insert a user message row (agent_type='user', session_id=NULL, chat=content)."""
+        """Insert a user message row.
+
+        agent_type='user'       for pipeline user step messages.
+        agent_type='user_input' for free intervention/instruction messages.
+        """
         async with self._lock:
             cur = await self._db.execute(
                 "INSERT INTO sessions (conv_id, round_index, step_index, agent_type, chat)"
-                " VALUES (?, ?, ?, 'user', ?)",
-                (conv_id, round_index, step_index, content),
+                " VALUES (?, ?, ?, ?, ?)",
+                (conv_id, round_index, step_index, agent_type, content),
             )
             await self._db.commit()
             return cur.lastrowid
@@ -264,9 +269,9 @@ class Database:
         return dict(row) if row else None
 
     async def get_sessions(self, conv_id: int, limit: int = 20, offset: int = 0) -> list:
-        """Agent sessions for a conversation, newest first. Excludes user messages."""
+        """Agent sessions for the sidebar. Excludes user messages (both pipeline and intervention)."""
         cur = await self._db.execute(
-            "SELECT * FROM sessions WHERE conv_id = ? AND agent_type != 'user'"
+            "SELECT * FROM sessions WHERE conv_id = ? AND agent_type NOT IN ('user', 'user_input')"
             " ORDER BY id DESC LIMIT ? OFFSET ?",
             (conv_id, limit, offset),
         )
@@ -275,7 +280,7 @@ class Database:
     async def get_session_count(self, conv_id: int) -> int:
         """Total number of agent sessions for a conversation."""
         cur = await self._db.execute(
-            "SELECT COUNT(*) FROM sessions WHERE conv_id = ? AND agent_type != 'user'",
+            "SELECT COUNT(*) FROM sessions WHERE conv_id = ? AND agent_type NOT IN ('user', 'user_input')",
             (conv_id,),
         )
         return (await cur.fetchone())[0]
@@ -293,9 +298,14 @@ class Database:
         return [dict(r) for r in await cur.fetchall()]
 
     async def get_latest_session(self, conv_id: int) -> Optional[dict]:
-        """Most recently created agent session for a conversation. Excludes user messages."""
+        """Most recently created formal pipeline session for progress tracking.
+
+        Includes pipeline user steps (agent_type='user') and agent sessions.
+        Excludes free intervention messages (agent_type='user_input').
+        """
         cur = await self._db.execute(
-            "SELECT * FROM sessions WHERE conv_id = ? AND agent_type != 'user' ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM sessions WHERE conv_id = ? AND agent_type != 'user_input'"
+            " ORDER BY id DESC LIMIT 1",
             (conv_id,)
         )
         row = await cur.fetchone()
@@ -348,14 +358,28 @@ class Database:
         rows = [dict(r) for r in await cur.fetchall()]
         return list(reversed(rows))   # oldest first
 
+    async def get_user_input_for_step(self, conv_id: int, round_index: int, step_index: int) -> Optional[str]:
+        """Return the pipeline user step input for a specific round/step, or None."""
+        cur = await self._db.execute(
+            "SELECT chat FROM sessions"
+            " WHERE conv_id = ? AND round_index = ? AND step_index = ?"
+            " AND agent_type = 'user' AND chat IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (conv_id, round_index, step_index),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
     async def get_latest_user_message(self, conv_id: int, limit: int = 1) -> list:
-        """Return the most recent user message(s) content for a conversation.
+        """Return the most recent intervention message(s) for prompt injection.
 
         Returns list of strings ordered newest-first. Empty list if none.
+        Only returns free intervention messages (agent_type='user_input'),
+        not pipeline user steps (agent_type='user').
         """
         cur = await self._db.execute(
             "SELECT chat FROM sessions"
-            " WHERE conv_id = ? AND agent_type = 'user' AND chat IS NOT NULL"
+            " WHERE conv_id = ? AND agent_type = 'user_input' AND chat IS NOT NULL"
             " ORDER BY id DESC LIMIT ?",
             (conv_id, limit),
         )
@@ -363,14 +387,15 @@ class Database:
         return [r[0] for r in rows]
 
     async def get_recent_summaries(self, conv_id: int, limit: int = 3) -> list:
-        """Return context for the last `limit` agent sessions, including any user messages in between.
+        """Return context for the last `limit` formal pipeline steps for {chat_history}.
 
-        Finds the ID of the Nth-from-last agent session, then returns all rows
-        (agent + user) with id >= that threshold, oldest-first.
+        Counts N formal steps (agents + pipeline user steps, excludes interventions).
+        Finds the Nth-from-last formal step, then returns all rows from that point
+        (including interventions that fall in the window) oldest-first.
         """
         cur = await self._db.execute(
             "SELECT id FROM sessions"
-            " WHERE conv_id = ? AND agent_type != 'user' AND chat IS NOT NULL"
+            " WHERE conv_id = ? AND agent_type != 'user_input' AND chat IS NOT NULL"
             " ORDER BY id DESC LIMIT 1 OFFSET ?",
             (conv_id, limit - 1),
         )

@@ -55,6 +55,16 @@ def _extract_claude_text_delta(event_json: str) -> str:
     return ''
 
 
+def _extract_gemini_text(event_json: str) -> str:
+    try:
+        e = json.loads(event_json)
+        if isinstance(e, dict) and e.get('type') == 'text':
+            return e.get('content') or ''
+    except Exception:
+        pass
+    return ''
+
+
 def _extract_codex_text(event_json: str) -> str:
     try:
         e = json.loads(event_json)
@@ -124,7 +134,9 @@ class RoundController:
         self._stop_requested     = False
         self._stop_after_current = False
         self._one_round_only     = False
+        self._single_step_only   = False   # resume_session: stop after the one resumed step
         self._lock               = asyncio.Lock()
+        self._waiting_for_input  = False
 
     # ------------------------------------------------------------------
     # Public read-only helpers
@@ -138,6 +150,9 @@ class RoundController:
 
     def is_running(self) -> bool:
         return self.state == RoundState.RUNNING
+
+    def is_waiting_for_input(self) -> bool:
+        return self._waiting_for_input
 
     # ------------------------------------------------------------------
     # Control commands
@@ -220,11 +235,30 @@ class RoundController:
             self._one_round_only     = False
 
             if self.current_round.round_index == 0:
-                # No in-memory state — restore from DB
+                # No in-memory state — restore from DB.
+                # If this conversation has no prior sessions yet, initialize
+                # from pipeline config and continue from Round 1-1.
                 conv_id = conversation_id or self.current_round.conversation_id
-                if not conv_id or not await self._restore_from_db(conv_id, for_retry=False):
+                if not conv_id:
                     await self.broadcast({'type': 'system', 'content': '没有可继续的流程'})
                     return False
+                if not await self._restore_from_db(conv_id, for_retry=False):
+                    steps = await self.db.get_pipeline_steps(conv_id)
+                    conv  = await self.db.get_conversation(conv_id)
+                    if not steps:
+                        steps = [
+                            {'agent_type': 'codex',  'prompt_template': None},
+                            {'agent_type': 'claude', 'prompt_template': None},
+                        ]
+                    self.current_round = RoundData(
+                        round_index     = 1,
+                        step_index      = 1,
+                        conversation_id = conv_id,
+                        pipeline_steps  = steps,
+                        working_dir     = conv.get('working_dir') if conv else None,
+                        max_rounds      = (conv.get('max_rounds') or 0) if conv else 0,
+                        api_err_retries = (conv.get('api_err_retries') if conv and conv.get('api_err_retries') is not None else 3),
+                    )
             else:
                 # Advance step in memory
                 next_step = self.current_round.step_index + 1
@@ -265,9 +299,27 @@ class RoundController:
 
             if self.current_round.round_index == 0:
                 conv_id = conversation_id or self.current_round.conversation_id
-                if not conv_id or not await self._restore_from_db(conv_id, for_retry=False):
+                if not conv_id:
                     await self.broadcast({'type': 'system', 'content': '没有可继续的流程'})
                     return False
+                if not await self._restore_from_db(conv_id, for_retry=False):
+                    # No prior sessions (e.g. user_input-only pipeline) — init fresh from config
+                    steps = await self.db.get_pipeline_steps(conv_id)
+                    conv  = await self.db.get_conversation(conv_id)
+                    if not steps:
+                        steps = [
+                            {'agent_type': 'codex',  'prompt_template': None},
+                            {'agent_type': 'claude', 'prompt_template': None},
+                        ]
+                    self.current_round = RoundData(
+                        round_index     = 0,
+                        step_index      = 1,
+                        conversation_id = conv_id,
+                        pipeline_steps  = steps,
+                        working_dir     = conv.get('working_dir') if conv else None,
+                        max_rounds      = (conv.get('max_rounds') or 0) if conv else 0,
+                        api_err_retries = (conv.get('api_err_retries') if conv and conv.get('api_err_retries') is not None else 3),
+                    )
 
             self.current_round.round_index += 1
             self.current_round.step_index   = 1
@@ -308,6 +360,7 @@ class RoundController:
 
             self._stop_requested     = False
             self._stop_after_current = False
+            self._single_step_only   = True   # only run this one step, then stop
 
             self.current_round = RoundData(
                 round_index     = session['round_index'],
@@ -441,7 +494,10 @@ class RoundController:
                                 break
                             self.current_round.user_inputs = ['继续']
                             retry_raw = await asyncio.gather(
-                                *[self._run_step(step, si, resume_id=rid) for si, step, rid in failed],
+                                *[self._run_step(step, si,
+                                                 resume_id=rid or (init_resume_id if si == init_step_si else None),
+                                                 session_pk=init_session_pk if si == init_step_si else None,
+                                                 ) for si, step, rid in failed],
                                 return_exceptions=True,
                             )
                             new_failed = []
@@ -466,6 +522,11 @@ class RoundController:
                     self.current_round.step_index = batch[-1][0]
                     self.current_round.resume_id  = None
                     self.current_round.session_pk = None
+
+                    if self._single_step_only:
+                        self._single_step_only = False
+                        round_done = False
+                        break
 
                 if not round_done:
                     break
@@ -499,6 +560,55 @@ class RoundController:
     # Step execution
     # ------------------------------------------------------------------
 
+    async def _run_user_input_step(self, step: dict, step_index: int) -> tuple:
+        """Pause the pipeline and wait for the user to send a message.
+
+        Broadcasts `waiting_for_input` so the frontend can prompt the user.
+        Blocks until a user_message arrives via receive_user_message() or stop is requested.
+        Returns (False, None) — no API error, no resume_id.
+        """
+        conv_id = self.current_round.conversation_id
+        round_index = self.current_round.round_index
+
+        # After a server restart, check if user already provided input for this step
+        if conv_id:
+            existing = await self.db.get_user_input_for_step(conv_id, round_index, step_index)
+            if existing:
+                self.current_round.user_inputs.append(existing)
+                return False, None
+
+        await self.broadcast({
+            'type':    'system',
+            'content': f'Round {round_index}-{step_index} · 用户',
+        })
+
+        pre_count = len(self.current_round.user_inputs)
+        self._waiting_for_input = True
+        await self.broadcast({
+            'type': 'waiting_for_input',
+            'active': True,
+            'conversation_id': conv_id,
+            'round_index': round_index,
+            'step_index': step_index,
+            'message': f'Round {round_index}-{step_index} 等待用户输入',
+        })
+        try:
+            while not self._stop_requested and not self._stop_after_current:
+                if len(self.current_round.user_inputs) > pre_count:
+                    break
+                await asyncio.sleep(0.2)
+        finally:
+            self._waiting_for_input = False
+            await self.broadcast({
+                'type': 'waiting_for_input',
+                'active': False,
+                'conversation_id': conv_id,
+                'round_index': round_index,
+                'step_index': step_index,
+            })
+
+        return False, None
+
     async def _run_step(self, step: dict, step_index: int,
                         resume_id: Optional[str] = None,
                         session_pk: Optional[int] = None) -> tuple:
@@ -508,8 +618,13 @@ class RoundController:
         resume_id is the CLI session ID captured during this run (for retries).
         """
         agent_type    = step.get('agent_type', 'claude')
+
+        if agent_type in ('user', 'user_input'):
+            return await self._run_user_input_step(step, step_index)
         conv_id       = self.current_round.conversation_id
         round_index   = self.current_round.round_index
+
+        log.info(f"_run_step: step_index={step_index}, round_index={round_index}, agent_type={agent_type}")
 
         is_resuming = resume_id is not None or session_pk is not None
 
@@ -517,6 +632,7 @@ class RoundController:
             session_pk = await self.db.create_session(
                 conv_id, round_index, step_index, agent_type
             )
+            log.info(f"Created session {session_pk}: Round {round_index}-{step_index}")
 
         # Broadcast status so frontend updates Round N-M display
         await self._broadcast_status()
@@ -608,6 +724,13 @@ class RoundController:
                                 'type': 'agent_output', 'agent': agent_type,
                                 'stream': 'stdout', 'content': t,
                             })
+                    elif agent_type == 'gemini':
+                        t = _extract_gemini_text(out.content)
+                        if t:
+                            await self.broadcast({
+                                'type': 'agent_output', 'agent': agent_type,
+                                'stream': 'stdout', 'content': t,
+                            })
                     elif agent_type == 'claude':
                         chunk = _extract_claude_text_delta(out.content)
                         if chunk:
@@ -640,7 +763,8 @@ class RoundController:
                             )
                             if cli_id and isinstance(cli_id, str):
                                 resume_id = cli_id
-                                await self.db.update_session_id(session_pk, cli_id)
+                                if not self._single_step_only:
+                                    await self.db.update_session_id(session_pk, cli_id)
                         except Exception:
                             pass
 
@@ -662,7 +786,8 @@ class RoundController:
                             cli_id  = data.get('session_id') or data.get('thread_id')
                             if cli_id:
                                 resume_id = cli_id
-                                await self.db.update_session_id(session_pk, cli_id)
+                                if not self._single_step_only:
+                                    await self.db.update_session_id(session_pk, cli_id)
                         except Exception:
                             pass
 
@@ -677,8 +802,11 @@ class RoundController:
             await _flush_buf()
 
             # Write summary (or NULL if killed / no output) into chat column
-            # If summary is empty, try to extract from JSONL file
-            if not summary:
+            # Gemini doesn't write response to stdout (only to JSONL), so always
+            # prefer JSONL extraction for it.  For other agents, only fall back to
+            # JSONL when _extract_summary returned nothing useful.
+            _fallback = f"{agent_type.capitalize()} completed this round"
+            if not summary or summary == _fallback or agent_type == 'gemini':
                 from . import session_reader
                 cli_id = resume_id
                 if cli_id:
@@ -687,10 +815,11 @@ class RoundController:
                         summary = extracted
                         log.info(f"Extracted summary from JSONL for session {session_pk}")
 
-            try:
-                await self.db.update_session_chat(session_pk, summary)
-            except Exception:
-                pass
+            if not self._single_step_only:
+                try:
+                    await self.db.update_session_chat(session_pk, summary)
+                except Exception:
+                    pass
 
         # Broadcast the completed chat bubble
         await self.broadcast({
@@ -716,7 +845,7 @@ class RoundController:
             return '（暂无对话历史）'
         lines = []
         for r in rows:
-            role     = {'codex': 'Codex', 'claude': 'Claude'}.get(r.get('role', ''), r.get('role', ''))
+            role     = {'codex': 'Codex', 'claude': 'Claude', 'gemini': 'Gemini'}.get(r.get('role', ''), r.get('role', ''))
             ts       = r.get('timestamp', '')
             time_str = ''
             if ts:
@@ -736,7 +865,12 @@ class RoundController:
         if resume_id:
             user_input = '继续'
             if self.current_round.user_inputs:
-                user_input = '\n'.join(f'- {u}' for u in self.current_round.user_inputs)
+                # For codex, avoid leading '-' which CLI interprets as option
+                # For other agents, use markdown list format
+                if agent_type == 'codex':
+                    user_input = '\n'.join(self.current_round.user_inputs)
+                else:
+                    user_input = '\n'.join(f'- {u}' for u in self.current_round.user_inputs)
                 self.current_round.user_inputs = []
             return user_input
 
@@ -816,6 +950,7 @@ class RoundController:
             'step_index':  self.current_round.step_index,
             'total_steps': len(steps) if steps else 0,
             'agent':       agent,
+            'waiting_for_input': self._waiting_for_input,
         })
 
     async def _restore_from_db(self, conversation_id: int, for_retry: bool = False) -> bool:

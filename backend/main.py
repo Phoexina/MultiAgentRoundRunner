@@ -22,7 +22,7 @@ def setup_logging(level: int = logging.INFO) -> None:
 
 
 async def main() -> None:
-    setup_logging()
+    setup_logging(level=logging.INFO)
     log = logging.getLogger(__name__)
 
     log.info("=" * 50)

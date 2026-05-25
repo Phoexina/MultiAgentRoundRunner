@@ -1,8 +1,9 @@
 """
 Stream Parser - Parse real-time stdout/stderr from agent subprocesses.
 
-parse_ndjson : stdout — chunk-based NDJSON parser, yields parsed event dicts
-read_lines   : stderr — raw line reader
+parse_ndjson   : stdout — chunk-based NDJSON parser, yields parsed event dicts
+parse_plaintext: stdout — plain-text wrapper, yields {"type":"text","content":line} dicts
+read_lines     : stderr — raw line reader
 """
 
 import json
@@ -162,3 +163,14 @@ async def read_lines(stream: Any) -> AsyncIterator[str]:
         if len(buffer) > MAX_LINE_LENGTH:
             buffer = buffer[:MAX_LINE_LENGTH] + "...[TRUNCATED]"
         yield buffer
+
+
+async def parse_plaintext(stream: Any) -> AsyncIterator[dict]:
+    """Wrap each non-empty stdout line as a text event.
+
+    Used by CLIs that output plain text instead of NDJSON (e.g. Gemini CLI).
+    Each line becomes {"type": "text", "content": "<line>"}.
+    """
+    async for line in read_lines(stream):
+        if line.strip():
+            yield {"type": "text", "content": line}
